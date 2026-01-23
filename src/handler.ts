@@ -21,6 +21,7 @@ const fixCors = ({ headers, status, statusText }: { headers?: HeadersInit; statu
 const BASE_URL = 'https://generativelanguage.googleapis.com';
 const API_VERSION = 'v1beta';
 const API_CLIENT = 'genai-js/0.21.0';
+const GEMINI_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
 
 const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	'x-goog-api-client': API_CLIENT,
@@ -31,6 +32,7 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class LoadBalancer extends DurableObject {
 	env: Env;
+	toolThoughtSignatureCache: Map<string, { signature: string; savedAt: number }>;
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -41,6 +43,7 @@ export class LoadBalancer extends DurableObject {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.env = env;
+		this.toolThoughtSignatureCache = new Map();
 		// Initialize the database schema upon first creation.
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS api_keys (
@@ -147,7 +150,9 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		console.log(`[fetch] Request received: ${request.method} ${request.url}`);
 		if (request.method === 'OPTIONS') {
+			console.log('[fetch] OPTIONS request, returning 204');
 			return new Response(null, {
 				status: 204,
 				headers: fixCors({}).headers,
@@ -155,6 +160,7 @@ export class LoadBalancer extends DurableObject {
 		}
 		const url = new URL(request.url);
 		const pathname = url.pathname;
+		console.log(`[fetch] Pathname: ${pathname}`);
 
 		// 静态资源直接放行
 		if (pathname === '/favicon.ico' || pathname === '/robots.txt') {
@@ -192,6 +198,7 @@ export class LoadBalancer extends DurableObject {
 			pathname.endsWith('/embeddings') ||
 			pathname.endsWith('/v1/models')
 		) {
+			console.log('[fetch] OpenAI compatible route detected');
 			return this.handleOpenAI(request);
 		}
 
@@ -199,9 +206,10 @@ export class LoadBalancer extends DurableObject {
 		const authKey = this.env.AUTH_KEY;
 
 		let targetUrl = `${BASE_URL}${pathname}${search}`;
+		const adjustedRequest = await this.maybeConvertOpenAiRequestForGemini(request, pathname);
 
 		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
-			return this.forwardRequestWithLoadBalancing(targetUrl, request);
+			return this.forwardRequestWithLoadBalancing(targetUrl, adjustedRequest);
 		}
 
 		// 传统模式：验证 AUTH_KEY
@@ -227,7 +235,7 @@ export class LoadBalancer extends DurableObject {
 			}
 		}
 		// If authKey is not set, or if it was authorized, proceed to forward with load balancing.
-		return this.forwardRequestWithLoadBalancing(targetUrl, request);
+		return this.forwardRequestWithLoadBalancing(targetUrl, adjustedRequest);
 	}
 
 	async forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string): Promise<Response> {
@@ -458,6 +466,12 @@ export class LoadBalancer extends DurableObject {
 							id,
 							last: [],
 							reasoningLast: [],
+							toolCallIds: {},
+							toolCallArgs: {},
+							extractThoughtSignatureFromCandidate: this.extractThoughtSignatureFromCandidate.bind(this),
+							extractThoughtSignatureFromPart: this.extractThoughtSignatureFromPart.bind(this),
+							extractThoughtSignature: this.extractThoughtSignature.bind(this),
+							cacheToolThoughtSignature: this.cacheToolThoughtSignature.bind(this),
 							shared,
 						} as any)
 					)
@@ -503,8 +517,16 @@ export class LoadBalancer extends DurableObject {
 			threshold: 'BLOCK_NONE',
 		}));
 
+		const enableThinking = Boolean(
+			req.reasoning_effort ||
+			req.thinking_budget ||
+			req.budget_tokens ||
+			req.thinking_config ||
+			req.extra_body?.google?.thinking_config
+		);
+
 		return {
-			...(await this.transformMessages(req.messages)),
+			...(await this.transformMessages(req.messages, enableThinking)),
 			safetySettings,
 			generationConfig: this.transformConfig(req),
 			...this.transformTools(req),
@@ -565,7 +587,7 @@ export class LoadBalancer extends DurableObject {
 		return cfg;
 	}
 
-	private async transformMessages(messages: any[]) {
+	private async transformMessages(messages: any[], enableThinking = false) {
 		if (!messages) {
 			return {};
 		}
@@ -578,11 +600,49 @@ export class LoadBalancer extends DurableObject {
 				case 'system':
 					system_instruction = { parts: await this.transformMsg(item) };
 					continue;
-				case 'assistant':
-					item.role = 'model';
-					break;
+			case 'assistant':
+				item.role = 'model';
+				break;
 				case 'user':
 					break;
+			case 'tool':
+				// 工具响应消息：转换为 Gemini 的 functionResponse 格式
+				// OpenAI 格式: { role: "tool", tool_call_id: "call_abc", content: "result" }
+				// Gemini 格式: { role: "user", parts: [{ functionResponse: { name: "xxx", response: "result" } }] }
+				if (item.tool_call_id) {
+					// 从 tool_call_id 中提取工具名称
+					// format: "call_{tool_name}_{timestamp}"
+					const toolNameMatch = item.tool_call_id.match(/^call_([^_]+)_/);
+					const toolName = item.name || (toolNameMatch ? toolNameMatch[1] : 'unknown');
+
+						// 将 content 解析为对象（Gemini 要求 response 是对象，不是字符串）
+						let responseData = item.content;
+						if (typeof item.content === 'string') {
+							try {
+								responseData = JSON.parse(item.content);
+							} catch {
+								// 如果解析失败，保持原值
+								responseData = item.content;
+							}
+						}
+
+					const responsePayload =
+						responseData && typeof responseData === 'object' && 'output' in responseData
+							? responseData
+							: { output: responseData };
+					// 添加 functionResponse part
+					contents.push({
+						role: 'user',
+						parts: [{
+							functionResponse: {
+								id: item.tool_call_id,
+								name: toolName,
+								response: responsePayload,
+							},
+						}],
+					});
+				}
+				continue;
 				default:
 					throw new HttpError(`Unknown message role: "${item.role}"`, 400);
 			}
@@ -594,6 +654,35 @@ export class LoadBalancer extends DurableObject {
 				}
 			}
 
+			if (item.role === 'model' && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
+				const parts = await this.transformMsg(item);
+				for (const toolCall of item.tool_calls) {
+					const toolCallId = toolCall.id;
+					const cachedSignature = this.getCachedToolThoughtSignature(toolCallId);
+					const signature = cachedSignature || (enableThinking ? GEMINI_THOUGHT_SIGNATURE_SENTINEL : null);
+					let args = toolCall.function?.arguments ?? {};
+					if (typeof args === 'string') {
+						try {
+							args = JSON.parse(args);
+						} catch {
+							args = {};
+						}
+					}
+					parts.push({
+						...(signature ? { thoughtSignature: signature } : {}),
+						functionCall: {
+							id: toolCallId,
+							name: toolCall.function?.name || 'unknown',
+							args,
+						},
+					});
+				}
+				contents.push({
+					role: item.role,
+					parts,
+				});
+				continue;
+			}
 			contents.push({
 				role: item.role,
 				parts: await this.transformMsg(item),
@@ -604,7 +693,7 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	private async transformMsg({ content }: any) {
-		const parts = [];
+		const parts: any[] = [];
 		if (!Array.isArray(content)) {
 			parts.push({ text: content });
 			return parts;
@@ -665,10 +754,15 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	private adjustSchema(schema: any) {
-		const obj = schema[schema.type];
-		if (obj && typeof obj === 'object') {
-			delete obj.strict;
-			this.adjustProps(obj);
+		// schema 格式: { type: 'function', function: { name, parameters, strict } }
+		// 我们需要处理 function.parameters 中的 schema，并删除不兼容的字段
+		const funcDef = schema.function;
+		if (funcDef) {
+			// 删除 strict 字段（Gemini API 不支持）
+			delete funcDef.strict;
+			if (funcDef.parameters && typeof funcDef.parameters === 'object') {
+				this.adjustProps(funcDef.parameters);
+			}
 		}
 	}
 
@@ -677,22 +771,126 @@ export class LoadBalancer extends DurableObject {
 			return;
 		}
 		if (Array.isArray(schemaPart)) {
-			schemaPart.forEach(this.adjustProps);
+			schemaPart.forEach((item) => this.adjustProps(item));
 		} else {
+			// 删除 $schema 字段（Gemini API 不支持）
+			delete schemaPart.$schema;
+			// 删除 additionalProperties: false（Gemini API 不支持）
 			if (schemaPart.type === 'object' && schemaPart.properties && schemaPart.additionalProperties === false) {
 				delete schemaPart.additionalProperties;
 			}
-			Object.values(schemaPart).forEach(this.adjustProps);
+			Object.values(schemaPart).forEach((value) => this.adjustProps(value));
 		}
+	}
+
+	private async maybeConvertOpenAiRequestForGemini(request: Request, pathname: string): Promise<Request> {
+		if (!pathname.startsWith(`/${API_VERSION}/models/`)) {
+			return request;
+		}
+		if (request.method !== 'POST') {
+			return request;
+		}
+		const contentType = request.headers.get('content-type') || '';
+		if (!contentType.includes('application/json')) {
+			return request;
+		}
+
+		let rawBody: any;
+		try {
+			rawBody = await request.clone().json();
+		} catch {
+			return request;
+		}
+
+		const looksLikeOpenAi =
+			Array.isArray(rawBody?.messages) ||
+			rawBody?.tools ||
+			rawBody?.tool_choice ||
+			rawBody?.stream !== undefined ||
+			rawBody?.max_tokens !== undefined;
+		if (!looksLikeOpenAi) {
+			return request;
+		}
+
+		const convertedBody = await this.transformRequest(rawBody);
+		const headers = new Headers(request.headers);
+		headers.set('content-type', 'application/json');
+		return new Request(request.url, {
+			method: request.method,
+			headers,
+			body: JSON.stringify(convertedBody),
+		});
+	}
+
+	private extractThoughtSignature(value: any): string | null {
+		if (!value || typeof value !== 'object') {
+			return null;
+		}
+		const signature = value.thoughtSignature || value.thought_signature || value.signature;
+		if (!signature || typeof signature !== 'string') {
+			return null;
+		}
+		return signature;
+	}
+
+	private extractThoughtSignatureFromPart(part: any): string | null {
+		if (!part || typeof part !== 'object') {
+			return null;
+		}
+		return (
+			this.extractThoughtSignature(part) ||
+			this.extractThoughtSignature(part.metadata) ||
+			this.extractThoughtSignature(part.functionCall) ||
+			this.extractThoughtSignature(part.function_call) ||
+			this.extractThoughtSignature(part.functionCall?.metadata) ||
+			this.extractThoughtSignature(part.functionResponse) ||
+			this.extractThoughtSignature(part.function_response) ||
+			this.extractThoughtSignature(part.functionResponse?.metadata) ||
+			null
+		);
+	}
+
+	private extractThoughtSignatureFromCandidate(candidate: any, data?: any): string | null {
+		return (
+			this.extractThoughtSignature(candidate) ||
+			this.extractThoughtSignature(candidate?.content) ||
+			this.extractThoughtSignature(data) ||
+			null
+		);
+	}
+
+	private cacheToolThoughtSignature(id: string | null | undefined, signature: string | null | undefined) {
+		if (!id || !signature) {
+			return;
+		}
+		this.toolThoughtSignatureCache.set(id, { signature, savedAt: Date.now() });
+	}
+
+	private getCachedToolThoughtSignature(id: string | null | undefined): string | null {
+		if (!id) {
+			return null;
+		}
+		const cached = this.toolThoughtSignatureCache.get(id);
+		if (!cached) {
+			return null;
+		}
+		if (Date.now() - cached.savedAt > 6 * 60 * 60 * 1000) {
+			this.toolThoughtSignatureCache.delete(id);
+			return null;
+		}
+		return cached.signature;
 	}
 
 	private transformTools(req: any) {
 		let tools, tool_config;
 		if (req.tools) {
+			console.log('[transformTools] Input tools:', JSON.stringify(req.tools, null, 2));
 			const funcs = req.tools.filter((tool: any) => tool.type === 'function' && tool.function?.name !== 'googleSearch');
 			if (funcs.length > 0) {
-				funcs.forEach(this.adjustSchema);
+				// 修复 this 绑定问题
+				funcs.forEach((schema: any) => this.adjustSchema(schema));
 				tools = [{ function_declarations: funcs.map((schema: any) => schema.function) }];
+				console.log('[transformTools] Output tools:', JSON.stringify(tools, null, 2));
 			}
 		}
 		if (req.tool_choice) {
@@ -721,9 +919,26 @@ export class LoadBalancer extends DurableObject {
 			const message = { role: 'assistant', content: [] as string[] };
 			let reasoningContent = '';
 			let finalContent = '';
+			let toolCalls: any[] = [];
 
+			const candidateSignature = this.extractThoughtSignatureFromCandidate(cand, data);
 			for (const part of cand.content?.parts ?? []) {
-				if (part.text) {
+				// 处理工具调用
+				if (part.functionCall) {
+					const toolCallId = `call_${part.functionCall.name}_${Date.now()}`;
+					const signature = this.extractThoughtSignatureFromPart(part) || candidateSignature;
+					this.cacheToolThoughtSignature(toolCallId, signature);
+					toolCalls.push({
+						id: toolCallId,
+						type: 'function',
+						function: {
+							name: part.functionCall.name,
+							arguments: JSON.stringify(part.functionCall.args || {}),
+						},
+					});
+				}
+				// 处理文本内容
+				else if (part.text) {
 					// 检查是否是思考内容
 					// Gemini API 可能使用多种方式标识思考内容
 					const isThoughtContent =
@@ -760,12 +975,17 @@ export class LoadBalancer extends DurableObject {
 					content: finalContent || null,
 				},
 				logprobs: null,
-				finish_reason: reasonsMap[cand.finishReason] || cand.finishReason,
+				finish_reason: toolCalls.length > 0 ? 'tool_calls' : reasonsMap[cand.finishReason] || cand.finishReason,
 			};
 
 			// 如果有思考内容，添加到响应中
 			if (reasoningContent) {
 				messageObj.message.reasoning_content = reasoningContent;
+			}
+
+			// 如果有工具调用，添加到响应中
+			if (toolCalls.length > 0) {
+				messageObj.message.tool_calls = toolCalls;
 			}
 
 			return messageObj;
@@ -835,13 +1055,23 @@ export class LoadBalancer extends DurableObject {
 			for (const cand of candidates) {
 				const { index, content, finishReason } = cand;
 				const { parts } = content;
+				const candidateSignature = this.extractThoughtSignatureFromCandidate(cand, line);
 
-				// 分别处理思考内容和正常内容
+				// 分别处理思考内容、正常内容和工具调用
 				let reasoningText = '';
 				let finalText = '';
+				let functionCalls: Array<{ call: any; signature: string | null }> = [];
 
 				for (const part of parts) {
-					if (part.text) {
+					// 处理工具调用
+					if (part.functionCall) {
+						functionCalls.push({
+							call: part.functionCall,
+							signature: this.extractThoughtSignatureFromPart(part) || candidateSignature,
+						});
+					}
+					// 处理文本内容
+					else if (part.text) {
 						// 检查是否是思考内容
 						// Gemini API 可能使用多种方式标识思考内容
 						const isThoughtContent =
@@ -868,6 +1098,82 @@ export class LoadBalancer extends DurableObject {
 							// 这是正常的回答内容
 							finalText += part.text;
 						}
+					}
+				}
+
+				// 处理工具调用的流式输出
+				if (functionCalls.length > 0) {
+				for (const [toolCallIndex, fc] of functionCalls.entries()) {
+					const toolCallKey = `${index}_${toolCallIndex}`;
+
+					// 生成或获取 tool_call_id
+					if (!this.toolCallIds[toolCallKey]) {
+						this.toolCallIds[toolCallKey] = `call_${fc.call.name}_${Date.now()}`;
+					}
+					const toolCallId = this.toolCallIds[toolCallKey];
+					this.cacheToolThoughtSignature(toolCallId, fc.signature);
+
+						// 将 args 转换为 JSON 字符串
+					const argsStr = JSON.stringify(fc.call.args || {});
+
+						// 获取上次发送的参数长度
+						const lastArgsLength = this.toolCallArgs[toolCallKey] || 0;
+
+						// 计算增量
+						if (argsStr.length > lastArgsLength) {
+							const argsDelta = argsStr.substring(lastArgsLength);
+
+							// 创建 delta 对象
+							const deltaObj: any = {
+								tool_calls: [
+									{
+										index: toolCallIndex,
+										id: toolCallId,
+									},
+								],
+							};
+
+							// 如果是首次发送，添加 type 和 name
+							if (lastArgsLength === 0) {
+								deltaObj.tool_calls[0].type = 'function';
+								deltaObj.tool_calls[0].function = {
+									name: fc.call.name,
+								};
+							}
+
+							// 如果有增量参数，添加 arguments
+							if (argsDelta) {
+								if (!deltaObj.tool_calls[0].function) {
+									deltaObj.tool_calls[0].function = {};
+								}
+								deltaObj.tool_calls[0].function.arguments = argsDelta;
+							}
+
+							// 只在有内容时才发送
+							if (lastArgsLength === 0 || argsDelta) {
+								const toolCallObj = {
+									id: this.id,
+									object: 'chat.completion.chunk',
+									created: Math.floor(Date.now() / 1000),
+									model: this.model,
+									choices: [
+										{
+											index,
+											delta: deltaObj,
+											finish_reason: null,
+										},
+									],
+								};
+								controller.enqueue(`data: ${JSON.stringify(toolCallObj)}\n\n`);
+							}
+
+							// 更新已发送的参数长度
+							this.toolCallArgs[toolCallKey] = argsStr.length;
+						}
+						if (!this.toolCallsSeen) {
+							this.toolCallsSeen = {};
+						}
+						this.toolCallsSeen[index] = true;
 					}
 				}
 
@@ -965,7 +1271,7 @@ export class LoadBalancer extends DurableObject {
 							{
 								index,
 								delta: {},
-								finish_reason: reasonsMap[finishReason] || finishReason,
+								finish_reason: this.toolCallsSeen?.[index] ? 'tool_calls' : reasonsMap[finishReason] || finishReason,
 							},
 						],
 					};
@@ -1206,11 +1512,13 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	private async handleOpenAI(request: Request): Promise<Response> {
+		console.log('[handleOpenAI] Starting to handle OpenAI request');
 		const authKey = this.env.AUTH_KEY;
 		let apiKey: string | null;
 
 		const authHeader = request.headers.get('Authorization');
 		apiKey = authHeader?.replace('Bearer ', '') ?? null;
+		console.log('[handleOpenAI] API key provided:', !!apiKey);
 
 		// 如果启用了客户端 key 透传，直接使用客户端提供的 key
 		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
