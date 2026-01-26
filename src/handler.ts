@@ -517,16 +517,8 @@ export class LoadBalancer extends DurableObject {
 			threshold: 'BLOCK_NONE',
 		}));
 
-		const enableThinking = Boolean(
-			req.reasoning_effort ||
-			req.thinking_budget ||
-			req.budget_tokens ||
-			req.thinking_config ||
-			req.extra_body?.google?.thinking_config
-		);
-
 		return {
-			...(await this.transformMessages(req.messages, enableThinking)),
+			...(await this.transformMessages(req.messages)),
 			safetySettings,
 			generationConfig: this.transformConfig(req),
 			...this.transformTools(req),
@@ -587,7 +579,7 @@ export class LoadBalancer extends DurableObject {
 		return cfg;
 	}
 
-	private async transformMessages(messages: any[], enableThinking = false) {
+	private async transformMessages(messages: any[]) {
 		if (!messages) {
 			return {};
 		}
@@ -658,8 +650,9 @@ export class LoadBalancer extends DurableObject {
 				const parts = await this.transformMsg(item);
 				for (const toolCall of item.tool_calls) {
 					const toolCallId = toolCall.id;
-					const cachedSignature = this.getCachedToolThoughtSignature(toolCallId);
-					const signature = cachedSignature || (enableThinking ? GEMINI_THOUGHT_SIGNATURE_SENTINEL : null);
+					// 优先使用缓存的签名，否则使用 sentinel 值
+					// 注意：始终添加 thoughtSignature 以确保工具调用正常工作
+					const signature = this.getCachedToolThoughtSignature(toolCallId) || GEMINI_THOUGHT_SIGNATURE_SENTINEL;
 					let args = toolCall.function?.arguments ?? {};
 					if (typeof args === 'string') {
 						try {
@@ -669,7 +662,7 @@ export class LoadBalancer extends DurableObject {
 						}
 					}
 					parts.push({
-						...(signature ? { thoughtSignature: signature } : {}),
+						thoughtSignature: signature,
 						functionCall: {
 							id: toolCallId,
 							name: toolCall.function?.name || 'unknown',
