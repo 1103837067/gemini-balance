@@ -29,6 +29,59 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 	...more,
 });
 
+// =================================================================================================
+// Google OpenAI 兼容端点响应补丁
+// Google 返回的 tool_calls 缺少 index 字段，Vercel AI SDK 校验会报错
+// =================================================================================================
+
+/**
+ * 补丁非流式响应：给 choices[*].message.tool_calls[*] 添加缺失的 index
+ */
+function patchResponseBody(body: any) {
+	if (!body?.choices) return;
+	for (const choice of body.choices) {
+		patchToolCalls(choice?.message?.tool_calls);
+		patchToolCalls(choice?.delta?.tool_calls);
+	}
+}
+
+/**
+ * 给 tool_calls 数组中缺失 index 的元素补上 index
+ */
+function patchToolCalls(toolCalls: any[] | undefined) {
+	if (!Array.isArray(toolCalls)) return;
+	for (let i = 0; i < toolCalls.length; i++) {
+		if (toolCalls[i] && toolCalls[i].index === undefined) {
+			toolCalls[i].index = i;
+		}
+	}
+}
+
+/**
+ * 补丁流式 SSE chunk：逐行解析，对 data: {...} 行做 tool_calls index 补丁
+ */
+function patchStreamChunk(chunk: string, controller: TransformStreamDefaultController<string>) {
+	// SSE 格式：可能包含多行，逐行处理
+	const lines = chunk.split('\n');
+	for (let i = 0; i < lines.length; i++) {
+		let line = lines[i];
+		if (line.startsWith('data: ') && line.length > 6) {
+			const dataStr = line.substring(6).trim();
+			if (dataStr && dataStr !== '[DONE]' && dataStr.startsWith('{')) {
+				try {
+					const parsed = JSON.parse(dataStr);
+					patchResponseBody(parsed);
+					line = 'data: ' + JSON.stringify(parsed);
+				} catch {
+					// JSON 解析失败，保持原样
+				}
+			}
+		}
+		// 重建行（保留原始换行）
+		controller.enqueue(line + (i < lines.length - 1 ? '\n' : ''));
+	}
+}
+
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class LoadBalancer extends DurableObject {
 	env: Env;
@@ -307,21 +360,24 @@ export class LoadBalancer extends DurableObject {
 
 	/**
 	 * 将 OpenAI 格式请求直接 proxy 到 Google 的 OpenAI 兼容端点。
-	 * 零格式转换 —— Google 端点原生理解 OpenAI 格式。
+	 * Google 端点原生理解 OpenAI 格式，但有少量兼容性问题需要补丁：
+	 * - tool_calls 缺少 index 字段（Vercel AI SDK 校验要求必须有）
 	 *
 	 * 支持: chat/completions, embeddings, models
 	 */
 	private async handleOpenAIProxy(request: Request): Promise<Response> {
 		const apiKey = await this.resolveApiKey(request);
-		if (apiKey instanceof Response) return apiKey; // 返回的是错误响应
+		if (apiKey instanceof Response) return apiKey;
 
 		const url = new URL(request.url);
 		const pathname = url.pathname;
 
 		// 映射路径到 Google OpenAI 兼容端点
 		let targetPath: string;
+		let isChatCompletions = false;
 		if (pathname.endsWith('/chat/completions')) {
 			targetPath = '/chat/completions';
+			isChatCompletions = true;
 		} else if (pathname.endsWith('/embeddings')) {
 			targetPath = '/embeddings';
 		} else if (pathname.endsWith('/models')) {
@@ -332,6 +388,19 @@ export class LoadBalancer extends DurableObject {
 
 		const targetUrl = `${OPENAI_COMPAT_BASE}${targetPath}`;
 
+		// 对于 chat/completions，需要读取请求体判断是否 streaming
+		let requestBody: string | null = null;
+		let isStreaming = false;
+		if (isChatCompletions && request.method === 'POST') {
+			requestBody = await request.text();
+			try {
+				const parsed = JSON.parse(requestBody);
+				isStreaming = parsed.stream === true;
+			} catch {
+				// 解析失败就当不是 streaming
+			}
+		}
+
 		const headers = new Headers();
 		headers.set('Authorization', `Bearer ${apiKey}`);
 		if (request.headers.has('content-type')) {
@@ -341,7 +410,7 @@ export class LoadBalancer extends DurableObject {
 		const response = await fetch(targetUrl, {
 			method: request.method,
 			headers,
-			body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
+			body: requestBody ?? (request.method === 'GET' || request.method === 'HEAD' ? null : request.body),
 		});
 
 		// 处理 429 错误：标记 key 异常
@@ -354,7 +423,6 @@ export class LoadBalancer extends DurableObject {
 			);
 		}
 
-		// 透传响应（包括 streaming SSE），只加 CORS headers
 		const responseHeaders = new Headers(response.headers);
 		responseHeaders.set('Access-Control-Allow-Origin', '*');
 		responseHeaders.delete('transfer-encoding');
@@ -363,10 +431,26 @@ export class LoadBalancer extends DurableObject {
 		responseHeaders.delete('content-encoding');
 		responseHeaders.set('Referrer-Policy', 'no-referrer');
 
-		return new Response(response.body, {
-			status: response.status,
-			headers: responseHeaders,
-		});
+		// 非 OK 响应或非 chat/completions 直接透传
+		if (!response.ok || !isChatCompletions) {
+			return new Response(response.body, { status: response.status, headers: responseHeaders });
+		}
+
+		// chat/completions 响应需要补丁：Google 返回的 tool_calls 缺少 index 字段
+		if (isStreaming) {
+			// 流式响应：通过 TransformStream 给每个 SSE chunk 打补丁
+			const patchedBody = response
+				.body!.pipeThrough(new TextDecoderStream())
+				.pipeThrough(new TransformStream({ transform: patchStreamChunk }))
+				.pipeThrough(new TextEncoderStream());
+
+			return new Response(patchedBody, { status: response.status, headers: responseHeaders });
+		} else {
+			// 非流式响应：读取 JSON，打补丁后返回
+			const body = await response.json();
+			patchResponseBody(body);
+			return new Response(JSON.stringify(body), { status: response.status, headers: responseHeaders });
+		}
 	}
 
 	// =================================================================================================
