@@ -20,11 +20,11 @@ const fixCors = ({ headers, status, statusText }: { headers?: HeadersInit; statu
 
 const BASE_URL = 'https://generativelanguage.googleapis.com';
 const API_VERSION = 'v1beta';
-const API_CLIENT = 'genai-js/0.21.0';
-const GEMINI_THOUGHT_SIGNATURE_SENTINEL = 'skip_thought_signature_validator';
+// Google 官方 OpenAI 兼容端点
+const OPENAI_COMPAT_BASE = `${BASE_URL}/${API_VERSION}/openai`;
 
 const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
-	'x-goog-api-client': API_CLIENT,
+	'x-goog-api-client': 'genai-js/0.21.0',
 	...(apiKey && { 'x-goog-api-key': apiKey }),
 	...more,
 });
@@ -32,7 +32,6 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class LoadBalancer extends DurableObject {
 	env: Env;
-	toolThoughtSignatureCache: Map<string, { signature: string; savedAt: number }>;
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -43,7 +42,6 @@ export class LoadBalancer extends DurableObject {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.env = env;
-		this.toolThoughtSignatureCache = new Map();
 		// Initialize the database schema upon first creation.
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS api_keys (
@@ -150,9 +148,7 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		console.log(`[fetch] Request received: ${request.method} ${request.url}`);
 		if (request.method === 'OPTIONS') {
-			console.log('[fetch] OPTIONS request, returning 204');
 			return new Response(null, {
 				status: 204,
 				headers: fixCors({}).headers,
@@ -160,7 +156,6 @@ export class LoadBalancer extends DurableObject {
 		}
 		const url = new URL(request.url);
 		const pathname = url.pathname;
-		console.log(`[fetch] Pathname: ${pathname}`);
 
 		// 静态资源直接放行
 		if (pathname === '/favicon.ico' || pathname === '/robots.txt') {
@@ -191,37 +186,32 @@ export class LoadBalancer extends DurableObject {
 
 		const search = url.search;
 
-		// OpenAI compatible routes
+		// OpenAI 兼容路由 → 直接 proxy 到 Google 官方 OpenAI 兼容端点
 		if (
 			pathname.endsWith('/chat/completions') ||
 			pathname.endsWith('/completions') ||
 			pathname.endsWith('/embeddings') ||
 			pathname.endsWith('/v1/models')
 		) {
-			console.log('[fetch] OpenAI compatible route detected');
-			return this.handleOpenAI(request);
+			return this.handleOpenAIProxy(request);
 		}
 
-		// OpenAI Responses API route
+		// OpenAI Responses API route → 仍需手写转换（Google 不支持）
 		if (pathname.endsWith('/responses') || pathname.match(/\/responses\/[^/]+$/)) {
-			console.log('[fetch] OpenAI Responses API route detected');
 			return this.handleResponsesAPI(request);
 		}
 
-		// Direct Gemini proxy
+		// Direct Gemini proxy (原生 Gemini API 请求直接透传)
 		const authKey = this.env.AUTH_KEY;
-
 		let targetUrl = `${BASE_URL}${pathname}${search}`;
-		const adjustedRequest = await this.maybeConvertOpenAiRequestForGemini(request, pathname);
 
 		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
-			return this.forwardRequestWithLoadBalancing(targetUrl, adjustedRequest);
+			return this.forwardRequestWithLoadBalancing(targetUrl, request);
 		}
 
 		// 传统模式：验证 AUTH_KEY
 		if (authKey) {
 			let isAuthorized = false;
-			// Check key in query parameters
 			if (search.includes('key=')) {
 				const urlObj = new URL(targetUrl);
 				const requestKey = urlObj.searchParams.get('key');
@@ -229,7 +219,6 @@ export class LoadBalancer extends DurableObject {
 					isAuthorized = true;
 				}
 			} else {
-				// Check x-goog-api-key in headers
 				const requestKey = request.headers.get('x-goog-api-key');
 				if (requestKey && requestKey === authKey) {
 					isAuthorized = true;
@@ -240,13 +229,14 @@ export class LoadBalancer extends DurableObject {
 				return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
 			}
 		}
-		// If authKey is not set, or if it was authorized, proceed to forward with load balancing.
-		return this.forwardRequestWithLoadBalancing(targetUrl, adjustedRequest);
+		return this.forwardRequestWithLoadBalancing(targetUrl, request);
 	}
 
-	async forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string): Promise<Response> {
-		console.log(`Request Sending to Gemini: ${targetUrl}`);
+	// =================================================================================================
+	// 通用请求转发（负载均衡）
+	// =================================================================================================
 
+	private async forwardRequest(targetUrl: string, request: Request, headers: Headers, apiKey: string): Promise<Response> {
 		const response = await fetch(targetUrl, {
 			method: request.method,
 			headers: headers,
@@ -254,15 +244,13 @@ export class LoadBalancer extends DurableObject {
 		});
 
 		if (response.status === 429) {
-			console.log(`API key ${apiKey} received 429 status code.`);
+			console.error(`API key ${apiKey} received 429 status code.`);
 			await this.ctx.storage.sql.exec(
 				"UPDATE api_key_statuses SET key_group = 'abnormal', failed_count = failed_count + 1, last_checked_at = ? WHERE api_key = ?",
 				Date.now(),
 				apiKey
 			);
 		}
-
-		console.log('Call Gemini Success');
 
 		const responseHeaders = new Headers(response.headers);
 		responseHeaders.set('Access-Control-Allow-Origin', '*');
@@ -278,28 +266,24 @@ export class LoadBalancer extends DurableObject {
 		});
 	}
 
-	// 对请求进行负载均衡，随机分发key
 	private async forwardRequestWithLoadBalancing(targetUrl: string, request: Request): Promise<Response> {
 		try {
 			let headers = new Headers();
 			const url = new URL(targetUrl);
 
-			// Forward content-type header
 			if (request.headers.has('content-type')) {
 				headers.set('content-type', request.headers.get('content-type')!);
 			}
 
 			if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
-				// 提取客户端的 API key
 				const clientApiKey = this.extractClientApiKey(request, url);
-
 				if (clientApiKey) {
 					url.searchParams.set('key', clientApiKey);
 					headers.set('x-goog-api-key', clientApiKey);
 				}
-
 				return this.forwardRequest(url.toString(), request, headers, clientApiKey || '');
 			}
+
 			const apiKey = await this.getRandomApiKey();
 			if (!apiKey) {
 				return new Response('No API keys configured in the load balancer.', { status: 500 });
@@ -317,199 +301,253 @@ export class LoadBalancer extends DurableObject {
 		}
 	}
 
-	async handleModels(apiKey: string) {
-		const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
-			headers: makeHeaders(apiKey),
-		});
+	// =================================================================================================
+	// OpenAI 兼容路由 → 纯 proxy 透传到 Google 官方 OpenAI 兼容端点
+	// =================================================================================================
 
-		let responseBody: BodyInit | null = response.body;
-		if (response.ok) {
-			const { models } = JSON.parse(await response.text());
-			responseBody = JSON.stringify(
-				{
-					object: 'list',
-					data: models.map(({ name }: any) => ({
-						id: name.replace('models/', ''),
-						object: 'model',
-						created: 0,
-						owned_by: '',
-					})),
-				},
-				null,
-				'  '
-			);
-		}
-		return new Response(responseBody, fixCors(response));
-	}
+	/**
+	 * 将 OpenAI 格式请求直接 proxy 到 Google 的 OpenAI 兼容端点。
+	 * 零格式转换 —— Google 端点原生理解 OpenAI 格式。
+	 *
+	 * 支持: chat/completions, embeddings, models
+	 */
+	private async handleOpenAIProxy(request: Request): Promise<Response> {
+		const apiKey = await this.resolveApiKey(request);
+		if (apiKey instanceof Response) return apiKey; // 返回的是错误响应
 
-	async handleEmbeddings(req: any, apiKey: string) {
-		const DEFAULT_EMBEDDINGS_MODEL = 'text-embedding-004';
+		const url = new URL(request.url);
+		const pathname = url.pathname;
 
-		if (typeof req.model !== 'string') {
-			throw new HttpError('model is not specified', 400);
-		}
-
-		let model;
-		if (req.model.startsWith('models/')) {
-			model = req.model;
+		// 映射路径到 Google OpenAI 兼容端点
+		let targetPath: string;
+		if (pathname.endsWith('/chat/completions')) {
+			targetPath = '/chat/completions';
+		} else if (pathname.endsWith('/embeddings')) {
+			targetPath = '/embeddings';
+		} else if (pathname.endsWith('/models')) {
+			targetPath = '/models';
 		} else {
-			if (!req.model.startsWith('gemini-')) {
-				req.model = DEFAULT_EMBEDDINGS_MODEL;
-			}
-			model = 'models/' + req.model;
+			return new Response('Not Found', { status: 404 });
 		}
 
-		if (!Array.isArray(req.input)) {
-			req.input = [req.input];
+		const targetUrl = `${OPENAI_COMPAT_BASE}${targetPath}`;
+
+		const headers = new Headers();
+		headers.set('Authorization', `Bearer ${apiKey}`);
+		if (request.headers.has('content-type')) {
+			headers.set('Content-Type', request.headers.get('content-type')!);
 		}
 
-		const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
-			method: 'POST',
-			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
-			body: JSON.stringify({
-				requests: req.input.map((text: string) => ({
-					model,
-					content: { parts: { text } },
-					outputDimensionality: req.dimensions,
-				})),
-			}),
+		const response = await fetch(targetUrl, {
+			method: request.method,
+			headers,
+			body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
 		});
 
-		let responseBody: BodyInit | null = response.body;
-		if (response.ok) {
-			const { embeddings } = JSON.parse(await response.text());
-			responseBody = JSON.stringify(
-				{
-					object: 'list',
-					data: embeddings.map(({ values }: any, index: number) => ({
-						object: 'embedding',
-						index,
-						embedding: values,
-					})),
-					model: req.model,
-				},
-				null,
-				'  '
+		// 处理 429 错误：标记 key 异常
+		if (response.status === 429) {
+			console.error(`API key received 429 from Google OpenAI compat endpoint.`);
+			await this.ctx.storage.sql.exec(
+				"UPDATE api_key_statuses SET key_group = 'abnormal', failed_count = failed_count + 1, last_checked_at = ? WHERE api_key = ?",
+				Date.now(),
+				apiKey
 			);
 		}
-		return new Response(responseBody, fixCors(response));
-	}
 
-	async handleCompletions(req: any, apiKey: string) {
-		const DEFAULT_MODEL = 'gemini-2.5-flash';
-		let model = DEFAULT_MODEL;
+		// 透传响应（包括 streaming SSE），只加 CORS headers
+		const responseHeaders = new Headers(response.headers);
+		responseHeaders.set('Access-Control-Allow-Origin', '*');
+		responseHeaders.delete('transfer-encoding');
+		responseHeaders.delete('connection');
+		responseHeaders.delete('keep-alive');
+		responseHeaders.delete('content-encoding');
+		responseHeaders.set('Referrer-Policy', 'no-referrer');
 
-		switch (true) {
-			case typeof req.model !== 'string':
-				break;
-			case req.model.startsWith('models/'):
-				model = req.model.substring(7);
-				break;
-			case req.model.startsWith('gemini-'):
-			case req.model.startsWith('gemma-'):
-			case req.model.startsWith('learnlm-'):
-				model = req.model;
-		}
-
-		let body = await this.transformRequest(req);
-		const extra = req.extra_body?.google;
-
-		if (extra) {
-			if (extra.safety_settings) {
-				body.safetySettings = extra.safety_settings;
-			}
-			if (extra.cached_content) {
-				body.cachedContent = extra.cached_content;
-			}
-			if (extra.thinking_config) {
-				body.generationConfig.thinkingConfig = extra.thinking_config;
-			}
-		}
-
-		switch (true) {
-			case model.endsWith(':search'):
-				model = model.substring(0, model.length - 7);
-			case req.model.endsWith('-search-preview'):
-			case req.tools?.some((tool: any) => tool.function?.name === 'googleSearch'):
-				body.tools = body.tools || [];
-				body.tools.push({ function_declarations: [{ name: 'googleSearch', parameters: {} }] });
-		}
-
-		const TASK = req.stream ? 'streamGenerateContent' : 'generateContent';
-		let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-		if (req.stream) {
-			url += '?alt=sse';
-		}
-
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
-			body: JSON.stringify(body),
+		return new Response(response.body, {
+			status: response.status,
+			headers: responseHeaders,
 		});
-
-		let responseBody: BodyInit | null = response.body;
-		if (response.ok) {
-			let id = 'chatcmpl-' + this.generateId();
-			const shared = {};
-
-			if (req.stream) {
-				responseBody = response
-					.body!.pipeThrough(new TextDecoderStream())
-					.pipeThrough(
-						new TransformStream({
-							transform: this.parseStream,
-							flush: this.parseStreamFlush,
-							buffer: '',
-							shared,
-						} as any)
-					)
-					.pipeThrough(
-						new TransformStream({
-							transform: this.toOpenAiStream,
-							flush: this.toOpenAiStreamFlush,
-							streamIncludeUsage: req.stream_options?.include_usage,
-							model,
-							id,
-							last: [],
-							reasoningLast: [],
-							toolCallIds: {},
-							toolCallArgs: {},
-							extractThoughtSignatureFromCandidate: this.extractThoughtSignatureFromCandidate.bind(this),
-							extractThoughtSignatureFromPart: this.extractThoughtSignatureFromPart.bind(this),
-							extractThoughtSignature: this.extractThoughtSignature.bind(this),
-							cacheToolThoughtSignature: this.cacheToolThoughtSignature.bind(this),
-							shared,
-						} as any)
-					)
-					.pipeThrough(new TextEncoderStream());
-			} else {
-				let body: any = await response.text();
-				try {
-					body = JSON.parse(body);
-					if (!body.candidates) {
-						throw new Error('Invalid completion object');
-					}
-				} catch (err) {
-					console.error('Error parsing response:', err);
-					return new Response(JSON.stringify({ error: 'Failed to parse response' }), {
-						...fixCors(response),
-						status: 500,
-					});
-				}
-				responseBody = this.processCompletionsResponse(body, model, id);
-			}
-		}
-		return new Response(responseBody, fixCors(response));
 	}
 
-	// 辅助方法
+	// =================================================================================================
+	// 认证 + API Key 解析（公共方法）
+	// =================================================================================================
+
+	/**
+	 * 从请求中解析出真正要使用的 Gemini API Key。
+	 * - FORWARD_CLIENT_KEY_ENABLED 模式：直接用客户端传来的 key
+	 * - 传统模式：验证 AUTH_KEY，然后从 key 池中随机选一个
+	 *
+	 * @returns apiKey string 或 Response（错误响应）
+	 */
+	private async resolveApiKey(request: Request): Promise<string | Response> {
+		const authHeader = request.headers.get('Authorization');
+		const clientKey = authHeader?.replace('Bearer ', '') ?? null;
+
+		if (!clientKey) {
+			return new Response('No API key found in the client headers, please check your request!', {
+				status: 400,
+				headers: fixCors({}).headers,
+			});
+		}
+
+		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
+			return clientKey;
+		}
+
+		// 传统模式：验证 AUTH_KEY
+		const authKey = this.env.AUTH_KEY;
+		if (authKey && clientKey !== authKey) {
+			return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
+		}
+
+		// 从 key 池中随机选一个
+		const apiKey = await this.getRandomApiKey();
+		if (!apiKey) {
+			return new Response('No API keys configured in the load balancer.', { status: 500, headers: fixCors({}).headers });
+		}
+		return apiKey;
+	}
+
+	// =================================================================================================
+	// OpenAI Responses API（Google 不支持，需要手写转换）
+	// =================================================================================================
+
+	private async handleResponsesAPI(request: Request): Promise<Response> {
+		const apiKey = await this.resolveApiKey(request);
+		if (apiKey instanceof Response) return apiKey;
+
+		const url = new URL(request.url);
+		const pathname = url.pathname;
+
+		const errHandler = (err: Error) => {
+			console.error('[handleResponsesAPI] Error:', err);
+			const errorResponse = {
+				error: {
+					message: err.message ?? 'Internal Server Error',
+					type: 'server_error',
+					code: 'internal_error',
+				},
+			};
+			return new Response(JSON.stringify(errorResponse), {
+				...fixCors({ headers: { 'Content-Type': 'application/json' } }),
+				status: 500,
+			});
+		};
+
+		try {
+			// POST /v1/responses - Create a response
+			if (request.method === 'POST' && pathname.endsWith('/responses')) {
+				const reqBody = await request.json();
+				return this.handleCreateResponse(reqBody, apiKey).catch(errHandler);
+			}
+
+			// GET /v1/responses/{id} - Not implemented (stateless proxy)
+			if (request.method === 'GET' && pathname.match(/\/responses\/[^/]+$/)) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: 'This proxy does not support stateful response retrieval. Use store: false in your requests.',
+							type: 'invalid_request_error',
+							code: 'not_implemented',
+						},
+					}),
+					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
+				);
+			}
+
+			// DELETE /v1/responses/{id} - Not implemented
+			if (request.method === 'DELETE' && pathname.match(/\/responses\/[^/]+$/)) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: 'This proxy does not support response deletion.',
+							type: 'invalid_request_error',
+							code: 'not_implemented',
+						},
+					}),
+					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
+				);
+			}
+
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: 'Method not allowed',
+						type: 'invalid_request_error',
+						code: 'method_not_allowed',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 405 }
+			);
+		} catch (err: any) {
+			return errHandler(err);
+		}
+	}
+
+	// =================================================================================================
+	// Responses API 实现（需要手写转换，因为 Google 官方不支持 Responses API）
+	// =================================================================================================
+
 	private generateId(): string {
 		const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 		const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
 		return Array.from({ length: 29 }, randomChar).join('');
 	}
 
-	private async transformRequest(req: any) {
+	private async handleCreateResponse(req: any, apiKey: string): Promise<Response> {
+		const DEFAULT_MODEL = 'gemini-2.5-flash';
+		let model = DEFAULT_MODEL;
+
+		if (typeof req.model === 'string') {
+			if (req.model.startsWith('models/')) {
+				model = req.model.substring(7);
+			} else if (req.model.startsWith('gemini-') || req.model.startsWith('gemma-') || req.model.startsWith('learnlm-')) {
+				model = req.model;
+			}
+		}
+
+		const geminiBody = this.convertResponsesInputToGemini(req);
+		const isStreaming = req.stream === true;
+		const TASK = isStreaming ? 'streamGenerateContent' : 'generateContent';
+		let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+		if (isStreaming) {
+			url += '?alt=sse';
+		}
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
+			body: JSON.stringify(geminiBody),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('[handleCreateResponse] Gemini API error:', response.status, errorText);
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: `Gemini API error: ${errorText}`,
+						type: 'api_error',
+						code: 'upstream_error',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: response.status }
+			);
+		}
+
+		const responseId = 'resp_' + this.generateId();
+		const messageId = 'msg_' + this.generateId();
+		const createdAt = Math.floor(Date.now() / 1000);
+
+		if (isStreaming) {
+			return this.handleResponsesStream(response, model, responseId, messageId, createdAt, req);
+		} else {
+			return this.handleResponsesNonStream(response, model, responseId, messageId, createdAt, req);
+		}
+	}
+
+	private convertResponsesInputToGemini(req: any): any {
 		const harmCategory = [
 			'HARM_CATEGORY_HATE_SPEECH',
 			'HARM_CATEGORY_SEXUALLY_EXPLICIT',
@@ -523,783 +561,610 @@ export class LoadBalancer extends DurableObject {
 			threshold: 'BLOCK_NONE',
 		}));
 
-		return {
-			...(await this.transformMessages(req.messages)),
-			safetySettings,
-			generationConfig: this.transformConfig(req),
-			...this.transformTools(req),
-			cachedContent: undefined as any,
-		};
-	}
-
-	private transformConfig(req: any) {
-		const fieldsMap: Record<string, string> = {
-			frequency_penalty: 'frequencyPenalty',
-			max_completion_tokens: 'maxOutputTokens',
-			max_tokens: 'maxOutputTokens',
-			n: 'candidateCount',
-			presence_penalty: 'presencePenalty',
-			seed: 'seed',
-			stop: 'stopSequences',
-			temperature: 'temperature',
-			top_k: 'topK',
-			top_p: 'topP',
-		};
-
-		const thinkingBudgetMap: Record<string, number> = {
-			low: 1024,
-			medium: 8192,
-			high: 24576,
-		};
-
-		let cfg: any = {};
-		for (let key in req) {
-			const matchedKey = fieldsMap[key];
-			if (matchedKey) {
-				cfg[matchedKey] = req[key];
-			}
-		}
-
-		if (req.response_format) {
-			switch (req.response_format.type) {
-				case 'json_schema':
-					cfg.responseSchema = req.response_format.json_schema?.schema;
-					if (cfg.responseSchema && 'enum' in cfg.responseSchema) {
-						cfg.responseMimeType = 'text/x.enum';
-						break;
-					}
-				case 'json_object':
-					cfg.responseMimeType = 'application/json';
-					break;
-				case 'text':
-					cfg.responseMimeType = 'text/plain';
-					break;
-				default:
-					throw new HttpError('Unsupported response_format.type', 400);
-			}
-		}
-		if (req.reasoning_effort) {
-			cfg.thinkingConfig = { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
-		}
-
-		return cfg;
-	}
-
-	private async transformMessages(messages: any[]) {
-		if (!messages) {
-			return {};
-		}
-
 		const contents: any[] = [];
-		let system_instruction;
 
-		for (const item of messages) {
-			switch (item.role) {
-				case 'system':
-					system_instruction = { parts: await this.transformMsg(item) };
+		// Handle instructions (system message)
+		let systemInstruction: any = undefined;
+		if (req.instructions) {
+			systemInstruction = {
+				parts: [{ text: req.instructions }],
+			};
+		}
+
+		// Handle input - can be string or array
+		if (typeof req.input === 'string') {
+			contents.push({
+				role: 'user',
+				parts: [{ text: req.input }],
+			});
+		} else if (Array.isArray(req.input)) {
+			let pendingFunctionCalls: any[] = [];
+			let pendingFunctionResponses: any[] = [];
+
+			for (const item of req.input) {
+				if (item.type === 'function_call') {
+					if (pendingFunctionResponses.length > 0) {
+						contents.push({ role: 'user', parts: pendingFunctionResponses });
+						pendingFunctionResponses = [];
+					}
+					let args = item.arguments ?? {};
+					if (typeof args === 'string') {
+						try { args = JSON.parse(args); } catch { args = {}; }
+					}
+					pendingFunctionCalls.push({
+						functionCall: { name: item.name, args },
+					});
 					continue;
-			case 'assistant':
-				item.role = 'model';
-				break;
-				case 'user':
-					break;
-			case 'tool':
-				// 工具响应消息：转换为 Gemini 的 functionResponse 格式
-				// OpenAI 格式: { role: "tool", tool_call_id: "call_abc", content: "result" }
-				// Gemini 格式: { role: "user", parts: [{ functionResponse: { name: "xxx", response: "result" } }] }
-				if (item.tool_call_id) {
-					// 从 tool_call_id 中提取工具名称
-					// format: "call_{tool_name}_{timestamp}"
-					const toolNameMatch = item.tool_call_id.match(/^call_([^_]+)_/);
-					const toolName = item.name || (toolNameMatch ? toolNameMatch[1] : 'unknown');
+				}
 
-						// 将 content 解析为对象（Gemini 要求 response 是对象，不是字符串）
-						let responseData = item.content;
-						if (typeof item.content === 'string') {
-							try {
-								responseData = JSON.parse(item.content);
-							} catch {
-								// 如果解析失败，保持原值
-								responseData = item.content;
+				if (item.type === 'function_call_output') {
+					if (pendingFunctionCalls.length > 0) {
+						contents.push({ role: 'model', parts: pendingFunctionCalls });
+						pendingFunctionCalls = [];
+					}
+					let output = item.output;
+					if (typeof output === 'string') {
+						try { output = JSON.parse(output); } catch { output = { result: output }; }
+					}
+					pendingFunctionResponses.push({
+						functionResponse: {
+							name: item.call_id ? item.call_id.split('_')[1] : 'unknown',
+							response: output,
+						},
+					});
+					continue;
+				}
+
+				// Flush pending items before other types
+				if (pendingFunctionCalls.length > 0) {
+					contents.push({ role: 'model', parts: pendingFunctionCalls });
+					pendingFunctionCalls = [];
+				}
+				if (pendingFunctionResponses.length > 0) {
+					contents.push({ role: 'user', parts: pendingFunctionResponses });
+					pendingFunctionResponses = [];
+				}
+
+				if (item.type === 'message') {
+					const role = item.role === 'assistant' ? 'model' : 'user';
+					const parts: any[] = [];
+
+					if (Array.isArray(item.content)) {
+						for (const contentPart of item.content) {
+							if (contentPart.type === 'input_text' || contentPart.type === 'output_text') {
+								parts.push({ text: contentPart.text });
+							} else if (contentPart.type === 'input_image') {
+								if (contentPart.image_url) {
+									parts.push({
+										inlineData: {
+											mimeType: 'image/jpeg',
+											data: contentPart.image_url.replace(/^data:image\/[^;]+;base64,/, ''),
+										},
+									});
+								}
 							}
 						}
-
-					const responsePayload =
-						responseData && typeof responseData === 'object' && 'output' in responseData
-							? responseData
-							: { output: responseData };
-					// 添加 functionResponse part
-					contents.push({
-						role: 'user',
-						parts: [{
-							functionResponse: {
-								id: item.tool_call_id,
-								name: toolName,
-								response: responsePayload,
-							},
-						}],
-					});
-				}
-				continue;
-				default:
-					throw new HttpError(`Unknown message role: "${item.role}"`, 400);
-			}
-
-			if (system_instruction) {
-				// 修复：确保 parts 是数组后再调用 some 方法
-				if (!contents[0]?.parts || (Array.isArray(contents[0]?.parts) && !contents[0]?.parts.some((part: any) => part.text))) {
-					contents.unshift({ role: 'user', parts: [{ text: ' ' }] });
-				}
-			}
-
-			if (item.role === 'model' && Array.isArray(item.tool_calls) && item.tool_calls.length > 0) {
-				const parts = await this.transformMsg(item);
-				for (const toolCall of item.tool_calls) {
-					const toolCallId = toolCall.id;
-					// 优先使用缓存的签名，否则使用 sentinel 值
-					// 注意：始终添加 thoughtSignature 以确保工具调用正常工作
-					const signature = this.getCachedToolThoughtSignature(toolCallId) || GEMINI_THOUGHT_SIGNATURE_SENTINEL;
-					let args = toolCall.function?.arguments ?? {};
-					if (typeof args === 'string') {
-						try {
-							args = JSON.parse(args);
-						} catch {
-							args = {};
-						}
+					} else if (typeof item.content === 'string') {
+						parts.push({ text: item.content });
 					}
-					parts.push({
-						thoughtSignature: signature,
-						functionCall: {
-							id: toolCallId,
-							name: toolCall.function?.name || 'unknown',
-							args,
-						},
+
+					if (parts.length > 0) {
+						contents.push({ role, parts });
+					}
+				} else if (item.role) {
+					const role = item.role === 'assistant' ? 'model' : 'user';
+					const parts: any[] = [];
+
+					if (Array.isArray(item.content)) {
+						for (const contentPart of item.content) {
+							if (typeof contentPart === 'string') {
+								parts.push({ text: contentPart });
+							} else if (contentPart.type === 'text' || contentPart.type === 'input_text') {
+								parts.push({ text: contentPart.text });
+							}
+						}
+					} else if (typeof item.content === 'string') {
+						parts.push({ text: item.content });
+					}
+
+					if (parts.length > 0) {
+						contents.push({ role, parts });
+					}
+				}
+			}
+
+			// Flush remaining
+			if (pendingFunctionCalls.length > 0) {
+				contents.push({ role: 'model', parts: pendingFunctionCalls });
+			}
+			if (pendingFunctionResponses.length > 0) {
+				contents.push({ role: 'user', parts: pendingFunctionResponses });
+			}
+		}
+
+		// Build generation config
+		const generationConfig: any = {};
+		if (req.temperature !== undefined) generationConfig.temperature = req.temperature;
+		if (req.top_p !== undefined) generationConfig.topP = req.top_p;
+		if (req.max_output_tokens !== undefined) generationConfig.maxOutputTokens = req.max_output_tokens;
+
+		// Handle function tools
+		const tools: any[] = [];
+		if (Array.isArray(req.tools)) {
+			const functionDeclarations: any[] = [];
+			for (const tool of req.tools) {
+				if (tool.type === 'function') {
+					const params = tool.parameters ? { ...tool.parameters } : undefined;
+					if (params) {
+						delete params.$schema;
+						delete params.additionalProperties;
+					}
+					functionDeclarations.push({
+						name: tool.name,
+						description: tool.description,
+						parameters: params,
 					});
 				}
-				contents.push({
-					role: item.role,
-					parts,
-				});
-				continue;
 			}
-			contents.push({
-				role: item.role,
-				parts: await this.transformMsg(item),
-			});
-		}
-
-		return { system_instruction, contents };
-	}
-
-	private async transformMsg({ content }: any) {
-		const parts: any[] = [];
-		if (!Array.isArray(content)) {
-			parts.push({ text: content });
-			return parts;
-		}
-
-		for (const item of content) {
-			switch (item.type) {
-				case 'text':
-					parts.push({ text: item.text });
-					break;
-				case 'image_url':
-					parts.push(await this.parseImg(item.image_url.url));
-					break;
-				case 'input_audio':
-					parts.push({
-						inlineData: {
-							mimeType: 'audio/' + item.input_audio.format,
-							data: item.input_audio.data,
-						},
-					});
-					break;
-				default:
-					throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
+			if (functionDeclarations.length > 0) {
+				tools.push({ function_declarations: functionDeclarations });
 			}
 		}
 
-		if (content.every((item) => item.type === 'image_url')) {
-			parts.push({ text: '' }); // to avoid "Unable to submit request because it must have a text parameter"
-		}
-		return parts;
-	}
-	private async parseImg(url: any) {
-		let mimeType, data;
-		if (url.startsWith('http://') || url.startsWith('https://')) {
-			try {
-				const response = await fetch(url);
-				if (!response.ok) {
-					throw new Error(`${response.status} ${response.statusText} (${url})`);
-				}
-				mimeType = response.headers.get('content-type');
-				data = Buffer.from(await response.arrayBuffer()).toString('base64');
-			} catch (err) {
-				throw new Error('Error fetching image: ' + (err as Error).message);
-			}
-		} else {
-			const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
-			if (!match) {
-				throw new HttpError('Invalid image data: ' + url, 400);
-			}
-			({ mimeType, data } = match.groups);
-		}
-		return {
-			inlineData: {
-				mimeType,
-				data,
-			},
-		};
-	}
-
-	private adjustSchema(schema: any) {
-		// schema 格式: { type: 'function', function: { name, parameters, strict } }
-		// 我们需要处理 function.parameters 中的 schema，并删除不兼容的字段
-		const funcDef = schema.function;
-		if (funcDef) {
-			// 删除 strict 字段（Gemini API 不支持）
-			delete funcDef.strict;
-			if (funcDef.parameters && typeof funcDef.parameters === 'object') {
-				this.adjustProps(funcDef.parameters);
-			}
-		}
-	}
-
-	private adjustProps(schemaPart: any) {
-		if (typeof schemaPart !== 'object' || schemaPart === null) {
-			return;
-		}
-		if (Array.isArray(schemaPart)) {
-			schemaPart.forEach((item) => this.adjustProps(item));
-		} else {
-			// 删除 $schema 字段（Gemini API 不支持）
-			delete schemaPart.$schema;
-			// 删除 additionalProperties: false（Gemini API 不支持）
-			if (schemaPart.type === 'object' && schemaPart.properties && schemaPart.additionalProperties === false) {
-				delete schemaPart.additionalProperties;
-			}
-			Object.values(schemaPart).forEach((value) => this.adjustProps(value));
-		}
-	}
-
-	private async maybeConvertOpenAiRequestForGemini(request: Request, pathname: string): Promise<Request> {
-		if (!pathname.startsWith(`/${API_VERSION}/models/`)) {
-			return request;
-		}
-		if (request.method !== 'POST') {
-			return request;
-		}
-		const contentType = request.headers.get('content-type') || '';
-		if (!contentType.includes('application/json')) {
-			return request;
-		}
-
-		let rawBody: any;
-		try {
-			rawBody = await request.clone().json();
-		} catch {
-			return request;
-		}
-
-		const looksLikeOpenAi =
-			Array.isArray(rawBody?.messages) ||
-			rawBody?.tools ||
-			rawBody?.tool_choice ||
-			rawBody?.stream !== undefined ||
-			rawBody?.max_tokens !== undefined;
-		if (!looksLikeOpenAi) {
-			return request;
-		}
-
-		const convertedBody = await this.transformRequest(rawBody);
-		const headers = new Headers(request.headers);
-		headers.set('content-type', 'application/json');
-		return new Request(request.url, {
-			method: request.method,
-			headers,
-			body: JSON.stringify(convertedBody),
-		});
-	}
-
-	private extractThoughtSignature(value: any): string | null {
-		if (!value || typeof value !== 'object') {
-			return null;
-		}
-		const signature = value.thoughtSignature || value.thought_signature || value.signature;
-		if (!signature || typeof signature !== 'string') {
-			return null;
-		}
-		return signature;
-	}
-
-	private extractThoughtSignatureFromPart(part: any): string | null {
-		if (!part || typeof part !== 'object') {
-			return null;
-		}
-		return (
-			this.extractThoughtSignature(part) ||
-			this.extractThoughtSignature(part.metadata) ||
-			this.extractThoughtSignature(part.functionCall) ||
-			this.extractThoughtSignature(part.function_call) ||
-			this.extractThoughtSignature(part.functionCall?.metadata) ||
-			this.extractThoughtSignature(part.functionResponse) ||
-			this.extractThoughtSignature(part.function_response) ||
-			this.extractThoughtSignature(part.functionResponse?.metadata) ||
-			null
-		);
-	}
-
-	private extractThoughtSignatureFromCandidate(candidate: any, data?: any): string | null {
-		return (
-			this.extractThoughtSignature(candidate) ||
-			this.extractThoughtSignature(candidate?.content) ||
-			this.extractThoughtSignature(data) ||
-			null
-		);
-	}
-
-	private cacheToolThoughtSignature(id: string | null | undefined, signature: string | null | undefined) {
-		if (!id || !signature) {
-			return;
-		}
-		this.toolThoughtSignatureCache.set(id, { signature, savedAt: Date.now() });
-	}
-
-	private getCachedToolThoughtSignature(id: string | null | undefined): string | null {
-		if (!id) {
-			return null;
-		}
-		const cached = this.toolThoughtSignatureCache.get(id);
-		if (!cached) {
-			return null;
-		}
-		if (Date.now() - cached.savedAt > 6 * 60 * 60 * 1000) {
-			this.toolThoughtSignatureCache.delete(id);
-			return null;
-		}
-		return cached.signature;
-	}
-
-	private transformTools(req: any) {
-		let tools, tool_config;
-		if (req.tools) {
-			console.log('[transformTools] Input tools:', JSON.stringify(req.tools, null, 2));
-			const funcs = req.tools.filter((tool: any) => tool.type === 'function' && tool.function?.name !== 'googleSearch');
-			if (funcs.length > 0) {
-				// 修复 this 绑定问题
-				funcs.forEach((schema: any) => this.adjustSchema(schema));
-				tools = [{ function_declarations: funcs.map((schema: any) => schema.function) }];
-				console.log('[transformTools] Output tools:', JSON.stringify(tools, null, 2));
-			}
-		}
+		// Handle tool_choice
+		let toolConfig: any = undefined;
 		if (req.tool_choice) {
-			const allowed_function_names = req.tool_choice?.type === 'function' ? [req.tool_choice?.function?.name] : undefined;
-			if (allowed_function_names || typeof req.tool_choice === 'string') {
-				tool_config = {
+			if (typeof req.tool_choice === 'string') {
+				if (req.tool_choice === 'required') {
+					toolConfig = { function_calling_config: { mode: 'ANY' } };
+				} else if (req.tool_choice === 'none') {
+					toolConfig = { function_calling_config: { mode: 'NONE' } };
+				}
+			} else if (req.tool_choice.type === 'function') {
+				toolConfig = {
 					function_calling_config: {
-						mode: allowed_function_names ? 'ANY' : req.tool_choice.toUpperCase(),
-						allowed_function_names,
+						mode: 'ANY',
+						allowed_function_names: [req.tool_choice.name],
 					},
 				};
 			}
 		}
-		return { tools, tool_config };
+
+		return {
+			contents,
+			safetySettings,
+			generationConfig,
+			...(systemInstruction ? { system_instruction: systemInstruction } : {}),
+			...(tools.length > 0 ? { tools } : {}),
+			...(toolConfig ? { tool_config: toolConfig } : {}),
+		};
 	}
 
-	private processCompletionsResponse(data: any, model: string, id: string) {
-		const reasonsMap: Record<string, string> = {
-			STOP: 'stop',
-			MAX_TOKENS: 'length',
-			SAFETY: 'content_filter',
-			RECITATION: 'content_filter',
-		};
+	private async handleResponsesNonStream(
+		response: Response,
+		model: string,
+		responseId: string,
+		messageId: string,
+		createdAt: number,
+		req: any
+	): Promise<Response> {
+		let geminiResponse: any;
+		try {
+			geminiResponse = await response.json();
+		} catch (err) {
+			console.error('[handleResponsesNonStream] Failed to parse Gemini response:', err);
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: 'Failed to parse Gemini response',
+						type: 'api_error',
+						code: 'parse_error',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 500 }
+			);
+		}
 
-		const transformCandidatesMessage = (cand: any) => {
-			const message = { role: 'assistant', content: [] as string[] };
-			let reasoningContent = '';
-			let finalContent = '';
-			let toolCalls: any[] = [];
+		let outputText = '';
+		const functionCalls: any[] = [];
+		const candidate = geminiResponse.candidates?.[0];
 
-			const candidateSignature = this.extractThoughtSignatureFromCandidate(cand, data);
-			for (const part of cand.content?.parts ?? []) {
-				// 处理工具调用
+		if (candidate?.content?.parts) {
+			for (const part of candidate.content.parts) {
+				if (part.text) {
+					outputText += part.text;
+				}
 				if (part.functionCall) {
-					const toolCallId = `call_${part.functionCall.name}_${Date.now()}`;
-					const signature = this.extractThoughtSignatureFromPart(part) || candidateSignature;
-					this.cacheToolThoughtSignature(toolCallId, signature);
-					toolCalls.push({
-						id: toolCallId,
-						type: 'function',
-						function: {
-							name: part.functionCall.name,
-							arguments: JSON.stringify(part.functionCall.args || {}),
-						},
+					const callId = `call_${part.functionCall.name}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+					functionCalls.push({
+						type: 'function_call',
+						id: callId,
+						call_id: callId,
+						name: part.functionCall.name,
+						arguments: JSON.stringify(part.functionCall.args || {}),
+						status: 'completed',
 					});
 				}
-				// 处理文本内容
-				else if (part.text) {
-					// 检查是否是思考内容
-					// Gemini API 可能使用多种方式标识思考内容
-					const isThoughtContent =
-						part.thoughtToken ||
-						part.thought ||
-						part.thoughtTokens ||
-						(part.executableCode && part.executableCode.language === 'thought') ||
-						// 检查文本是否以思考标记开头
-						(part.text && (part.text.startsWith('<thinking>') || part.text.startsWith('思考：') || part.text.startsWith('Thinking:')));
-
-					if (isThoughtContent) {
-						// 这是思考内容，应该放在 reasoning_content 字段中
-						// 如果文本包含思考标记，需要移除这些标记
-						let cleanText = part.text;
-						if (cleanText.startsWith('<thinking>')) {
-							cleanText = cleanText.replace('<thinking>', '').replace('</thinking>', '');
-						} else if (cleanText.startsWith('思考：')) {
-							cleanText = cleanText.replace('思考：', '');
-						} else if (cleanText.startsWith('Thinking:')) {
-							cleanText = cleanText.replace('Thinking:', '');
-						}
-						reasoningContent += cleanText;
-					} else {
-						// 这是正常的回答内容
-						finalContent += part.text;
-					}
-				}
-			}
-
-			const messageObj: any = {
-				index: cand.index || 0,
-				message: {
-					role: 'assistant',
-					content: finalContent || null,
-				},
-				logprobs: null,
-				finish_reason: toolCalls.length > 0 ? 'tool_calls' : reasonsMap[cand.finishReason] || cand.finishReason,
-			};
-
-			// 如果有思考内容，添加到响应中
-			if (reasoningContent) {
-				messageObj.message.reasoning_content = reasoningContent;
-			}
-
-			// 如果有工具调用，添加到响应中
-			if (toolCalls.length > 0) {
-				messageObj.message.tool_calls = toolCalls;
-			}
-
-			return messageObj;
-		};
-
-		const obj = {
-			id,
-			choices: data.candidates.map(transformCandidatesMessage),
-			created: Math.floor(Date.now() / 1000),
-			model: data.modelVersion ?? model,
-			object: 'chat.completion',
-			usage: data.usageMetadata && {
-				completion_tokens: data.usageMetadata.candidatesTokenCount,
-				prompt_tokens: data.usageMetadata.promptTokenCount,
-				total_tokens: data.usageMetadata.totalTokenCount,
-			},
-		};
-
-		return JSON.stringify(obj);
-	}
-
-	// 流处理方法
-	private parseStream(this: any, chunk: string, controller: any) {
-		this.buffer += chunk;
-		const lines = this.buffer.split('\n');
-		this.buffer = lines.pop()!;
-
-		for (const line of lines) {
-			if (line.startsWith('data: ')) {
-				const data = line.substring(6);
-				if (data.startsWith('{')) {
-					controller.enqueue(JSON.parse(data));
-				}
 			}
 		}
-	}
 
-	private parseStreamFlush(this: any, controller: any) {
-		if (this.buffer) {
-			try {
-				controller.enqueue(JSON.parse(this.buffer));
-				this.shared.is_buffers_rest = true;
-			} catch (e) {
-				console.error('Error parsing remaining buffer:', e);
-			}
-		}
-	}
+		const usageMetadata = geminiResponse.usageMetadata || {};
+		const inputTokens = usageMetadata.promptTokenCount || 0;
+		const outputTokens = usageMetadata.candidatesTokenCount || 0;
 
-	private toOpenAiStream(this: any, line: any, controller: any) {
-		const reasonsMap: Record<string, string> = {
-			STOP: 'stop',
-			MAX_TOKENS: 'length',
-			SAFETY: 'content_filter',
-			RECITATION: 'content_filter',
-		};
-
-		const { candidates, usageMetadata } = line;
-		if (usageMetadata) {
-			this.shared.usage = {
-				completion_tokens: usageMetadata.candidatesTokenCount,
-				prompt_tokens: usageMetadata.promptTokenCount,
-				total_tokens: usageMetadata.totalTokenCount,
-			};
+		const output: any[] = [];
+		for (const fc of functionCalls) {
+			output.push(fc);
 		}
 
-		if (candidates) {
-			for (const cand of candidates) {
-				const { index, content, finishReason } = cand;
-				const { parts } = content;
-				const candidateSignature = this.extractThoughtSignatureFromCandidate(cand, line);
-
-				// 分别处理思考内容、正常内容和工具调用
-				let reasoningText = '';
-				let finalText = '';
-				let functionCalls: Array<{ call: any; signature: string | null }> = [];
-
-				for (const part of parts) {
-					// 处理工具调用
-					if (part.functionCall) {
-						functionCalls.push({
-							call: part.functionCall,
-							signature: this.extractThoughtSignatureFromPart(part) || candidateSignature,
-						});
-					}
-					// 处理文本内容
-					else if (part.text) {
-						// 检查是否是思考内容
-						// Gemini API 可能使用多种方式标识思考内容
-						const isThoughtContent =
-							part.thoughtToken ||
-							part.thought ||
-							part.thoughtTokens ||
-							(part.executableCode && part.executableCode.language === 'thought') ||
-							// 检查文本是否以思考标记开头
-							(part.text && (part.text.startsWith('<thinking>') || part.text.startsWith('思考：') || part.text.startsWith('Thinking:')));
-
-						if (isThoughtContent) {
-							// 这是思考内容
-							// 如果文本包含思考标记，需要移除这些标记
-							let cleanText = part.text;
-							if (cleanText.startsWith('<thinking>')) {
-								cleanText = cleanText.replace('<thinking>', '').replace('</thinking>', '');
-							} else if (cleanText.startsWith('思考：')) {
-								cleanText = cleanText.replace('思考：', '');
-							} else if (cleanText.startsWith('Thinking:')) {
-								cleanText = cleanText.replace('Thinking:', '');
-							}
-							reasoningText += cleanText;
-						} else {
-							// 这是正常的回答内容
-							finalText += part.text;
-						}
-					}
-				}
-
-				// 处理工具调用的流式输出
-				if (functionCalls.length > 0) {
-				for (const [toolCallIndex, fc] of functionCalls.entries()) {
-					const toolCallKey = `${index}_${toolCallIndex}`;
-
-					// 生成或获取 tool_call_id
-					if (!this.toolCallIds[toolCallKey]) {
-						this.toolCallIds[toolCallKey] = `call_${fc.call.name}_${Date.now()}`;
-					}
-					const toolCallId = this.toolCallIds[toolCallKey];
-					this.cacheToolThoughtSignature(toolCallId, fc.signature);
-
-						// 将 args 转换为 JSON 字符串
-					const argsStr = JSON.stringify(fc.call.args || {});
-
-						// 获取上次发送的参数长度
-						const lastArgsLength = this.toolCallArgs[toolCallKey] || 0;
-
-						// 计算增量
-						if (argsStr.length > lastArgsLength) {
-							const argsDelta = argsStr.substring(lastArgsLength);
-
-							// 创建 delta 对象
-							const deltaObj: any = {
-								tool_calls: [
-									{
-										index: toolCallIndex,
-										id: toolCallId,
-									},
-								],
-							};
-
-							// 如果是首次发送，添加 type 和 name
-							if (lastArgsLength === 0) {
-								deltaObj.tool_calls[0].type = 'function';
-								deltaObj.tool_calls[0].function = {
-									name: fc.call.name,
-								};
-							}
-
-							// 如果有增量参数，添加 arguments
-							if (argsDelta) {
-								if (!deltaObj.tool_calls[0].function) {
-									deltaObj.tool_calls[0].function = {};
-								}
-								deltaObj.tool_calls[0].function.arguments = argsDelta;
-							}
-
-							// 只在有内容时才发送
-							if (lastArgsLength === 0 || argsDelta) {
-								const toolCallObj = {
-									id: this.id,
-									object: 'chat.completion.chunk',
-									created: Math.floor(Date.now() / 1000),
-									model: this.model,
-									choices: [
-										{
-											index,
-											delta: deltaObj,
-											finish_reason: null,
-										},
-									],
-								};
-								controller.enqueue(`data: ${JSON.stringify(toolCallObj)}\n\n`);
-							}
-
-							// 更新已发送的参数长度
-							this.toolCallArgs[toolCallKey] = argsStr.length;
-						}
-						if (!this.toolCallsSeen) {
-							this.toolCallsSeen = {};
-						}
-						this.toolCallsSeen[index] = true;
-					}
-				}
-
-				// 处理思考内容的流式输出
-				if (reasoningText) {
-					if (!this.reasoningLast) this.reasoningLast = {};
-					if (this.reasoningLast[index] === undefined) {
-						this.reasoningLast[index] = '';
-					}
-
-					const lastReasoningText = this.reasoningLast[index] || '';
-					let reasoningDelta = '';
-
-					if (reasoningText.startsWith(lastReasoningText)) {
-						reasoningDelta = reasoningText.substring(lastReasoningText.length);
-					} else {
-						// Find the common prefix
-						let i = 0;
-						while (i < reasoningText.length && i < lastReasoningText.length && reasoningText[i] === lastReasoningText[i]) {
-							i++;
-						}
-						reasoningDelta = reasoningText.substring(i);
-					}
-
-					this.reasoningLast[index] = reasoningText;
-
-					if (reasoningDelta) {
-						const reasoningObj = {
-							id: this.id,
-							object: 'chat.completion.chunk',
-							created: Math.floor(Date.now() / 1000),
-							model: this.model,
-							choices: [
-								{
-									index,
-									delta: { reasoning_content: reasoningDelta },
-									finish_reason: null,
-								},
-							],
-						};
-						controller.enqueue(`data: ${JSON.stringify(reasoningObj)}\n\n`);
-					}
-				}
-
-				// 处理正常内容的流式输出
-				if (finalText) {
-					if (this.last[index] === undefined) {
-						this.last[index] = '';
-					}
-
-					const lastText = this.last[index] || '';
-					let delta = '';
-
-					if (finalText.startsWith(lastText)) {
-						delta = finalText.substring(lastText.length);
-					} else {
-						// Find the common prefix
-						let i = 0;
-						while (i < finalText.length && i < lastText.length && finalText[i] === lastText[i]) {
-							i++;
-						}
-						// Send the rest of the new text as delta.
-						// This might not be perfect for all clients, but it prevents data loss.
-						delta = finalText.substring(i);
-					}
-
-					this.last[index] = finalText;
-
-					if (delta) {
-						const obj = {
-							id: this.id,
-							object: 'chat.completion.chunk',
-							created: Math.floor(Date.now() / 1000),
-							model: this.model,
-							choices: [
-								{
-									index,
-									delta: { content: delta },
-									finish_reason: null,
-								},
-							],
-						};
-						controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
-					}
-				}
-
-				// 如果有完成原因，发送完成信号
-				if (finishReason) {
-					const finishObj = {
-						id: this.id,
-						object: 'chat.completion.chunk',
-						created: Math.floor(Date.now() / 1000),
-						model: this.model,
-						choices: [
-							{
-								index,
-								delta: {},
-								finish_reason: this.toolCallsSeen?.[index] ? 'tool_calls' : reasonsMap[finishReason] || finishReason,
-							},
-						],
-					};
-					controller.enqueue(`data: ${JSON.stringify(finishObj)}\n\n`);
-				}
-			}
-		}
-	}
-
-	private toOpenAiStreamFlush(this: any, controller: any) {
-		if (this.streamIncludeUsage && this.shared.usage) {
-			const obj = {
-				id: this.id,
-				object: 'chat.completion.chunk',
-				created: Math.floor(Date.now() / 1000),
-				model: this.model,
-				choices: [
+		if (outputText || functionCalls.length === 0) {
+			output.push({
+				type: 'message',
+				id: messageId,
+				status: 'completed',
+				role: 'assistant',
+				content: [
 					{
-						index: 0,
-						delta: {},
-						finish_reason: 'stop',
+						type: 'output_text',
+						text: outputText,
+						annotations: [],
 					},
 				],
-				usage: this.shared.usage,
-			};
-			controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
+			});
 		}
-		controller.enqueue('data: [DONE]\n\n');
+
+		const openAIResponse = {
+			id: responseId,
+			object: 'response',
+			created_at: createdAt,
+			status: 'completed',
+			completed_at: Math.floor(Date.now() / 1000),
+			error: null,
+			incomplete_details: null,
+			instructions: req.instructions || null,
+			max_output_tokens: req.max_output_tokens || null,
+			model: model,
+			output: output,
+			parallel_tool_calls: req.parallel_tool_calls ?? true,
+			previous_response_id: req.previous_response_id || null,
+			reasoning: { effort: null, summary: null },
+			store: req.store ?? true,
+			temperature: req.temperature ?? 1.0,
+			text: { format: { type: 'text' } },
+			tool_choice: req.tool_choice ?? 'auto',
+			tools: req.tools || [],
+			top_p: req.top_p ?? 1.0,
+			truncation: req.truncation ?? 'disabled',
+			usage: {
+				input_tokens: inputTokens,
+				input_tokens_details: { cached_tokens: 0 },
+				output_tokens: outputTokens,
+				output_tokens_details: { reasoning_tokens: 0 },
+				total_tokens: inputTokens + outputTokens,
+			},
+			user: req.user || null,
+			metadata: req.metadata || {},
+		};
+
+		return new Response(JSON.stringify(openAIResponse), {
+			...fixCors({ headers: { 'Content-Type': 'application/json' } }),
+		});
 	}
+
+	private handleResponsesStream(
+		response: Response,
+		model: string,
+		responseId: string,
+		messageId: string,
+		createdAt: number,
+		req: any
+	): Response {
+		const encoder = new TextEncoder();
+		let sequenceNumber = 0;
+
+		const buildResponseSnapshot = (overrides: any) => ({
+			id: responseId,
+			object: 'response',
+			created_at: createdAt,
+			error: null,
+			incomplete_details: null,
+			instructions: req.instructions || null,
+			max_output_tokens: req.max_output_tokens || null,
+			model: model,
+			output: [],
+			parallel_tool_calls: req.parallel_tool_calls ?? true,
+			previous_response_id: req.previous_response_id || null,
+			reasoning: { effort: null, summary: null },
+			store: req.store ?? true,
+			temperature: req.temperature ?? 1.0,
+			text: { format: { type: 'text' } },
+			tool_choice: req.tool_choice ?? 'auto',
+			tools: req.tools || [],
+			top_p: req.top_p ?? 1.0,
+			truncation: req.truncation ?? 'disabled',
+			usage: null,
+			user: req.user || null,
+			metadata: req.metadata || {},
+			...overrides,
+		});
+
+		const stream = new ReadableStream({
+			async start(controller) {
+				const sendEvent = (data: any) => {
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+				};
+
+				// 1. response.created
+				sendEvent({
+					type: 'response.created',
+					response: buildResponseSnapshot({ status: 'in_progress', completed_at: null }),
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 2. response.in_progress
+				sendEvent({
+					type: 'response.in_progress',
+					response: buildResponseSnapshot({ status: 'in_progress', completed_at: null }),
+					sequence_number: ++sequenceNumber,
+				});
+
+				// Process Gemini SSE stream
+				const reader = response.body!.getReader();
+				const decoder = new TextDecoder();
+				let buffer = '';
+				let fullText = '';
+				let inputTokens = 0;
+				let outputTokens = 0;
+
+				const functionCalls: any[] = [];
+				const seenFunctionCalls = new Set<string>();
+				let outputIndex = 0;
+				let textOutputIndex = -1;
+				let textContentStarted = false;
+
+				try {
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) break;
+
+						buffer += decoder.decode(value, { stream: true });
+						const lines = buffer.split('\n');
+						buffer = lines.pop() || '';
+
+						for (const line of lines) {
+							if (line.startsWith('data: ')) {
+								const dataStr = line.substring(6).trim();
+								if (!dataStr || dataStr === '[DONE]') continue;
+
+								try {
+									const data = JSON.parse(dataStr);
+									const candidate = data.candidates?.[0];
+
+									if (candidate?.content?.parts) {
+										for (const part of candidate.content.parts) {
+											// Handle function calls
+											if (part.functionCall) {
+												const funcName = part.functionCall.name;
+												const funcArgs = part.functionCall.args || {};
+												const callId = `call_${funcName}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+												const callKey = `${funcName}_${JSON.stringify(funcArgs)}`;
+												if (!seenFunctionCalls.has(callKey)) {
+													seenFunctionCalls.add(callKey);
+
+													const funcCallItem = {
+														type: 'function_call',
+														id: callId,
+														call_id: callId,
+														name: funcName,
+														arguments: JSON.stringify(funcArgs),
+														status: 'completed',
+													};
+													functionCalls.push(funcCallItem);
+
+													sendEvent({
+														type: 'response.output_item.added',
+														output_index: outputIndex,
+														item: {
+															type: 'function_call',
+															id: callId,
+															call_id: callId,
+															name: funcName,
+															arguments: '',
+															status: 'in_progress',
+														},
+														sequence_number: ++sequenceNumber,
+													});
+
+													sendEvent({
+														type: 'response.function_call_arguments.delta',
+														item_id: callId,
+														output_index: outputIndex,
+														delta: JSON.stringify(funcArgs),
+														sequence_number: ++sequenceNumber,
+													});
+
+													sendEvent({
+														type: 'response.function_call_arguments.done',
+														item_id: callId,
+														output_index: outputIndex,
+														arguments: JSON.stringify(funcArgs),
+														sequence_number: ++sequenceNumber,
+													});
+
+													sendEvent({
+														type: 'response.output_item.done',
+														output_index: outputIndex,
+														item: funcCallItem,
+														sequence_number: ++sequenceNumber,
+													});
+
+													outputIndex++;
+												}
+											}
+
+											// Handle text content
+											if (part.text) {
+												if (!textContentStarted) {
+													textContentStarted = true;
+													textOutputIndex = outputIndex;
+													outputIndex++;
+
+													sendEvent({
+														type: 'response.output_item.added',
+														output_index: textOutputIndex,
+														item: {
+															id: messageId,
+															status: 'in_progress',
+															type: 'message',
+															role: 'assistant',
+															content: [],
+														},
+														sequence_number: ++sequenceNumber,
+													});
+
+													sendEvent({
+														type: 'response.content_part.added',
+														item_id: messageId,
+														output_index: textOutputIndex,
+														content_index: 0,
+														part: {
+															type: 'output_text',
+															text: '',
+															annotations: [],
+														},
+														sequence_number: ++sequenceNumber,
+													});
+												}
+
+												fullText += part.text;
+
+												sendEvent({
+													type: 'response.output_text.delta',
+													item_id: messageId,
+													output_index: textOutputIndex,
+													content_index: 0,
+													delta: part.text,
+													sequence_number: ++sequenceNumber,
+												});
+											}
+										}
+									}
+
+									if (data.usageMetadata) {
+										inputTokens = data.usageMetadata.promptTokenCount || inputTokens;
+										outputTokens = data.usageMetadata.candidatesTokenCount || outputTokens;
+									}
+								} catch (parseErr) {
+									console.error('[handleResponsesStream] Failed to parse SSE data:', parseErr);
+								}
+							}
+						}
+					}
+				} catch (streamErr) {
+					console.error('[handleResponsesStream] Stream error:', streamErr);
+				}
+
+				const finalOutput: any[] = [];
+				for (const fc of functionCalls) {
+					finalOutput.push(fc);
+				}
+
+				if (textContentStarted) {
+					sendEvent({
+						type: 'response.output_text.done',
+						item_id: messageId,
+						output_index: textOutputIndex,
+						content_index: 0,
+						text: fullText,
+						sequence_number: ++sequenceNumber,
+					});
+
+					sendEvent({
+						type: 'response.content_part.done',
+						item_id: messageId,
+						output_index: textOutputIndex,
+						content_index: 0,
+						part: { type: 'output_text', text: fullText, annotations: [] },
+						sequence_number: ++sequenceNumber,
+					});
+
+					sendEvent({
+						type: 'response.output_item.done',
+						output_index: textOutputIndex,
+						item: {
+							id: messageId,
+							status: 'completed',
+							type: 'message',
+							role: 'assistant',
+							content: [{ type: 'output_text', text: fullText, annotations: [] }],
+						},
+						sequence_number: ++sequenceNumber,
+					});
+
+					finalOutput.push({
+						type: 'message',
+						id: messageId,
+						status: 'completed',
+						role: 'assistant',
+						content: [{ type: 'output_text', text: fullText, annotations: [] }],
+					});
+				} else if (functionCalls.length === 0) {
+					sendEvent({
+						type: 'response.output_item.added',
+						output_index: 0,
+						item: { id: messageId, status: 'completed', type: 'message', role: 'assistant', content: [] },
+						sequence_number: ++sequenceNumber,
+					});
+
+					sendEvent({
+						type: 'response.output_item.done',
+						output_index: 0,
+						item: { id: messageId, status: 'completed', type: 'message', role: 'assistant', content: [] },
+						sequence_number: ++sequenceNumber,
+					});
+
+					finalOutput.push({
+						type: 'message',
+						id: messageId,
+						status: 'completed',
+						role: 'assistant',
+						content: [],
+					});
+				}
+
+				const completedAt = Math.floor(Date.now() / 1000);
+				sendEvent({
+					type: 'response.completed',
+					response: buildResponseSnapshot({
+						status: 'completed',
+						completed_at: completedAt,
+						output: finalOutput,
+						usage: {
+							input_tokens: inputTokens,
+							input_tokens_details: { cached_tokens: 0 },
+							output_tokens: outputTokens,
+							output_tokens_details: { reasoning_tokens: 0 },
+							total_tokens: inputTokens + outputTokens,
+						},
+					}),
+					sequence_number: ++sequenceNumber,
+				});
+
+				controller.close();
+			},
+		});
+
+		return new Response(stream, {
+			headers: {
+				...fixCors({}).headers,
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				Connection: 'keep-alive',
+			},
+		});
+	}
+
 	// =================================================================================================
 	// Admin API Handlers
 	// =================================================================================================
@@ -1377,9 +1242,7 @@ export class LoadBalancer extends DurableObject {
 					try {
 						const response = await fetch(`${BASE_URL}/${API_VERSION}/models/gemini-2.5-flash:generateContent?key=${key}`, {
 							method: 'POST',
-							headers: {
-								'Content-Type': 'application/json',
-							},
+							headers: { 'Content-Type': 'application/json' },
 							body: JSON.stringify({
 								contents: [{ parts: [{ text: 'hi' }] }],
 							}),
@@ -1455,22 +1318,15 @@ export class LoadBalancer extends DurableObject {
 	// Helper Methods
 	// =================================================================================================
 
-	/**
-	 * 从请求中提取客户端的 API key
-	 * 支持多种传递方式：查询参数、x-goog-api-key header、Authorization header
-	 */
 	private extractClientApiKey(request: Request, url: URL): string | null {
-		// 从查询参数中提取
 		if (url.searchParams.has('key')) {
 			const key = url.searchParams.get('key');
 			if (key) return key;
 		}
 
-		// 从 x-goog-api-key header 中提取
 		const googApiKey = request.headers.get('x-goog-api-key');
 		if (googApiKey) return googApiKey;
 
-		// 从 Authorization header 中提取 (Bearer token)
 		const authHeader = request.headers.get('Authorization');
 		if (authHeader && authHeader.startsWith('Bearer ')) {
 			return authHeader.substring(7);
@@ -1481,1057 +1337,26 @@ export class LoadBalancer extends DurableObject {
 
 	private async getRandomApiKey(): Promise<string | null> {
 		try {
-			// First, try to get a key from the normal group
 			let results = await this.ctx.storage.sql
 				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'normal' ORDER BY RANDOM() LIMIT 1")
 				.raw<any>();
 			let keys = Array.from(results);
 			if (keys && keys.length > 0) {
-				const key = keys[0][0] as string;
-				console.log(`Gemini Selected API Key from normal group: ${key}`);
-				return key;
+				return keys[0][0] as string;
 			}
 
-			// If no keys in normal group, try the abnormal group
 			results = await this.ctx.storage.sql
 				.exec("SELECT api_key FROM api_key_statuses WHERE key_group = 'abnormal' ORDER BY RANDOM() LIMIT 1")
 				.raw<any>();
 			keys = Array.from(results);
 			if (keys && keys.length > 0) {
-				const key = keys[0][0] as string;
-				console.log(`Gemini Selected API Key from abnormal group: ${key}`);
-				return key;
+				return keys[0][0] as string;
 			}
 
 			return null;
 		} catch (error) {
 			console.error('获取随机API密钥失败:', error);
 			return null;
-		}
-	}
-
-	// ==================== OpenAI Responses API ====================
-
-	/**
-	 * Handle OpenAI Responses API requests
-	 * POST /v1/responses - Create a response
-	 * GET /v1/responses/{id} - Get a response (not implemented, returns error)
-	 * DELETE /v1/responses/{id} - Delete a response (not implemented, returns error)
-	 */
-	private async handleResponsesAPI(request: Request): Promise<Response> {
-		console.log('[handleResponsesAPI] Starting to handle Responses API request');
-		const authKey = this.env.AUTH_KEY;
-		let apiKey: string | null;
-
-		const authHeader = request.headers.get('Authorization');
-		apiKey = authHeader?.replace('Bearer ', '') ?? null;
-		console.log('[handleResponsesAPI] API key provided:', !!apiKey);
-
-		// 如果启用了客户端 key 透传，直接使用客户端提供的 key
-		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
-			if (!apiKey) {
-				return new Response('No API key found in the client headers, please check your request!', { status: 400 });
-			}
-		} else {
-			// 传统模式：验证 AUTH_KEY 并使用负载均衡
-			if (!apiKey) {
-				return new Response('No API key found in the client headers, please check your request!', { status: 400 });
-			}
-
-			if (authKey) {
-				const token = authHeader?.replace('Bearer ', '');
-				if (token !== authKey) {
-					return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
-				}
-				apiKey = await this.getRandomApiKey();
-				if (!apiKey) {
-					return new Response('No API keys configured in the load balancer.', { status: 500 });
-				}
-			}
-		}
-
-		const url = new URL(request.url);
-		const pathname = url.pathname;
-
-		const errHandler = (err: Error) => {
-			console.error('[handleResponsesAPI] Error:', err);
-			const errorResponse = {
-				error: {
-					message: err.message ?? 'Internal Server Error',
-					type: 'server_error',
-					code: 'internal_error',
-				},
-			};
-			return new Response(JSON.stringify(errorResponse), {
-				...fixCors({ headers: { 'Content-Type': 'application/json' } }),
-				status: 500,
-			});
-		};
-
-		try {
-			// POST /v1/responses - Create a response
-			if (request.method === 'POST' && pathname.endsWith('/responses')) {
-				const reqBody = await request.json();
-				return this.handleCreateResponse(reqBody, apiKey).catch(errHandler);
-			}
-
-			// GET /v1/responses/{id} - Not implemented (stateless proxy)
-			if (request.method === 'GET' && pathname.match(/\/responses\/[^/]+$/)) {
-				return new Response(
-					JSON.stringify({
-						error: {
-							message: 'This proxy does not support stateful response retrieval. Use store: false in your requests.',
-							type: 'invalid_request_error',
-							code: 'not_implemented',
-						},
-					}),
-					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
-				);
-			}
-
-			// DELETE /v1/responses/{id} - Not implemented
-			if (request.method === 'DELETE' && pathname.match(/\/responses\/[^/]+$/)) {
-				return new Response(
-					JSON.stringify({
-						error: {
-							message: 'This proxy does not support response deletion.',
-							type: 'invalid_request_error',
-							code: 'not_implemented',
-						},
-					}),
-					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
-				);
-			}
-
-			return new Response(
-				JSON.stringify({
-					error: {
-						message: 'Method not allowed',
-						type: 'invalid_request_error',
-						code: 'method_not_allowed',
-					},
-				}),
-				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 405 }
-			);
-		} catch (err: any) {
-			return errHandler(err);
-		}
-	}
-
-	/**
-	 * Create a model response (OpenAI Responses API)
-	 * Converts the request to Gemini format and returns OpenAI Responses format
-	 */
-	private async handleCreateResponse(req: any, apiKey: string): Promise<Response> {
-		console.log('[handleCreateResponse] Processing request');
-
-		const DEFAULT_MODEL = 'gemini-2.5-flash';
-		let model = DEFAULT_MODEL;
-
-		// Parse model from request
-		if (typeof req.model === 'string') {
-			if (req.model.startsWith('models/')) {
-				model = req.model.substring(7);
-			} else if (req.model.startsWith('gemini-') || req.model.startsWith('gemma-') || req.model.startsWith('learnlm-')) {
-				model = req.model;
-			}
-		}
-
-		// Convert Responses API input to Gemini format
-		const geminiBody = await this.convertResponsesInputToGemini(req);
-
-		// Determine if streaming
-		const isStreaming = req.stream === true;
-
-		const TASK = isStreaming ? 'streamGenerateContent' : 'generateContent';
-		let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-		if (isStreaming) {
-			url += '?alt=sse';
-		}
-
-		console.log('[handleCreateResponse] Calling Gemini API:', url, 'streaming:', isStreaming);
-
-		const response = await fetch(url, {
-			method: 'POST',
-			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
-			body: JSON.stringify(geminiBody),
-		});
-
-		if (!response.ok) {
-			const errorText = await response.text();
-			console.error('[handleCreateResponse] Gemini API error:', response.status, errorText);
-			return new Response(
-				JSON.stringify({
-					error: {
-						message: `Gemini API error: ${errorText}`,
-						type: 'api_error',
-						code: 'upstream_error',
-					},
-				}),
-				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: response.status }
-			);
-		}
-
-		// Generate response IDs
-		const responseId = 'resp_' + this.generateId();
-		const messageId = 'msg_' + this.generateId();
-		const createdAt = Math.floor(Date.now() / 1000);
-
-		if (isStreaming) {
-			// Stream response
-			return this.handleResponsesStream(response, model, responseId, messageId, createdAt, req);
-		} else {
-			// Non-streaming response
-			return this.handleResponsesNonStream(response, model, responseId, messageId, createdAt, req);
-		}
-	}
-
-	/**
-	 * Convert OpenAI Responses API input to Gemini format
-	 */
-	private async convertResponsesInputToGemini(req: any): Promise<any> {
-		const harmCategory = [
-			'HARM_CATEGORY_HATE_SPEECH',
-			'HARM_CATEGORY_SEXUALLY_EXPLICIT',
-			'HARM_CATEGORY_DANGEROUS_CONTENT',
-			'HARM_CATEGORY_HARASSMENT',
-			'HARM_CATEGORY_CIVIC_INTEGRITY',
-		];
-
-		const safetySettings = harmCategory.map((category) => ({
-			category,
-			threshold: 'BLOCK_NONE',
-		}));
-
-		const contents: any[] = [];
-
-		// Handle instructions (system message)
-		let systemInstruction: any = undefined;
-		if (req.instructions) {
-			systemInstruction = {
-				parts: [{ text: req.instructions }],
-			};
-		}
-
-		// Handle input - can be string or array
-		if (typeof req.input === 'string') {
-			contents.push({
-				role: 'user',
-				parts: [{ text: req.input }],
-			});
-		} else if (Array.isArray(req.input)) {
-			// 用于收集连续的 function_call 和 function_call_output
-			let pendingFunctionCalls: any[] = [];
-			let pendingFunctionResponses: any[] = [];
-
-			for (const item of req.input) {
-				// Handle function_call (assistant's tool call)
-				if (item.type === 'function_call') {
-					// Flush any pending function responses first
-					if (pendingFunctionResponses.length > 0) {
-						contents.push({
-							role: 'user',
-							parts: pendingFunctionResponses,
-						});
-						pendingFunctionResponses = [];
-					}
-
-					// Parse arguments
-					let args = item.arguments ?? {};
-					if (typeof args === 'string') {
-						try {
-							args = JSON.parse(args);
-						} catch {
-							args = {};
-						}
-					}
-
-					pendingFunctionCalls.push({
-						functionCall: {
-							name: item.name,
-							args: args,
-						},
-					});
-					continue;
-				}
-
-				// Handle function_call_output (tool result)
-				if (item.type === 'function_call_output') {
-					// Flush any pending function calls first
-					if (pendingFunctionCalls.length > 0) {
-						contents.push({
-							role: 'model',
-							parts: pendingFunctionCalls,
-						});
-						pendingFunctionCalls = [];
-					}
-
-					// Parse output
-					let output = item.output;
-					if (typeof output === 'string') {
-						try {
-							output = JSON.parse(output);
-						} catch {
-							// Keep as string if not valid JSON
-							output = { result: output };
-						}
-					}
-
-					pendingFunctionResponses.push({
-						functionResponse: {
-							name: item.call_id ? item.call_id.split('_')[1] : 'unknown', // Extract name from call_id
-							response: output,
-						},
-					});
-					continue;
-				}
-
-				// Flush any pending items before processing other types
-				if (pendingFunctionCalls.length > 0) {
-					contents.push({
-						role: 'model',
-						parts: pendingFunctionCalls,
-					});
-					pendingFunctionCalls = [];
-				}
-				if (pendingFunctionResponses.length > 0) {
-					contents.push({
-						role: 'user',
-						parts: pendingFunctionResponses,
-					});
-					pendingFunctionResponses = [];
-				}
-
-				if (item.type === 'message') {
-					const role = item.role === 'assistant' ? 'model' : 'user';
-					const parts: any[] = [];
-
-					if (Array.isArray(item.content)) {
-						for (const contentPart of item.content) {
-							if (contentPart.type === 'input_text' || contentPart.type === 'output_text') {
-								parts.push({ text: contentPart.text });
-							} else if (contentPart.type === 'input_image') {
-								// Handle image input
-								if (contentPart.image_url) {
-									parts.push({
-										inlineData: {
-											mimeType: 'image/jpeg',
-											data: contentPart.image_url.replace(/^data:image\/[^;]+;base64,/, ''),
-										},
-									});
-								}
-							}
-						}
-					} else if (typeof item.content === 'string') {
-						parts.push({ text: item.content });
-					}
-
-					if (parts.length > 0) {
-						contents.push({ role, parts });
-					}
-				} else if (item.role) {
-					// Simple message format
-					const role = item.role === 'assistant' ? 'model' : 'user';
-					const parts: any[] = [];
-
-					if (Array.isArray(item.content)) {
-						for (const contentPart of item.content) {
-							if (typeof contentPart === 'string') {
-								parts.push({ text: contentPart });
-							} else if (contentPart.type === 'text' || contentPart.type === 'input_text') {
-								parts.push({ text: contentPart.text });
-							}
-						}
-					} else if (typeof item.content === 'string') {
-						parts.push({ text: item.content });
-					}
-
-					if (parts.length > 0) {
-						contents.push({ role, parts });
-					}
-				}
-			}
-
-			// Flush any remaining pending items
-			if (pendingFunctionCalls.length > 0) {
-				contents.push({
-					role: 'model',
-					parts: pendingFunctionCalls,
-				});
-			}
-			if (pendingFunctionResponses.length > 0) {
-				contents.push({
-					role: 'user',
-					parts: pendingFunctionResponses,
-				});
-			}
-		}
-
-		// Build generation config
-		const generationConfig: any = {};
-		if (req.temperature !== undefined) generationConfig.temperature = req.temperature;
-		if (req.top_p !== undefined) generationConfig.topP = req.top_p;
-		if (req.max_output_tokens !== undefined) generationConfig.maxOutputTokens = req.max_output_tokens;
-
-		// Handle function tools
-		const tools: any[] = [];
-		if (Array.isArray(req.tools)) {
-			const functionDeclarations: any[] = [];
-			for (const tool of req.tools) {
-				if (tool.type === 'function') {
-					// Clean up parameters for Gemini compatibility
-					const params = tool.parameters ? { ...tool.parameters } : undefined;
-					if (params) {
-						delete params.$schema;
-						delete params.additionalProperties;
-					}
-					functionDeclarations.push({
-						name: tool.name,
-						description: tool.description,
-						parameters: params,
-					});
-				}
-			}
-			if (functionDeclarations.length > 0) {
-				tools.push({ function_declarations: functionDeclarations });
-			}
-		}
-
-		// Handle tool_choice
-		let toolConfig: any = undefined;
-		if (req.tool_choice) {
-			if (typeof req.tool_choice === 'string') {
-				if (req.tool_choice === 'required') {
-					toolConfig = { function_calling_config: { mode: 'ANY' } };
-				} else if (req.tool_choice === 'none') {
-					toolConfig = { function_calling_config: { mode: 'NONE' } };
-				}
-				// 'auto' is the default, no need to set
-			} else if (req.tool_choice.type === 'function') {
-				toolConfig = {
-					function_calling_config: {
-						mode: 'ANY',
-						allowed_function_names: [req.tool_choice.name],
-					},
-				};
-			}
-		}
-
-		return {
-			contents,
-			safetySettings,
-			generationConfig,
-			...(systemInstruction ? { system_instruction: systemInstruction } : {}),
-			...(tools.length > 0 ? { tools } : {}),
-			...(toolConfig ? { tool_config: toolConfig } : {}),
-		};
-	}
-
-	/**
-	 * Handle non-streaming response for Responses API
-	 */
-	private async handleResponsesNonStream(
-		response: Response,
-		model: string,
-		responseId: string,
-		messageId: string,
-		createdAt: number,
-		req: any
-	): Promise<Response> {
-		let geminiResponse: any;
-		try {
-			geminiResponse = await response.json();
-		} catch (err) {
-			console.error('[handleResponsesNonStream] Failed to parse Gemini response:', err);
-			return new Response(
-				JSON.stringify({
-					error: {
-						message: 'Failed to parse Gemini response',
-						type: 'api_error',
-						code: 'parse_error',
-					},
-				}),
-				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 500 }
-			);
-		}
-
-		// Extract content from Gemini response
-		let outputText = '';
-		const functionCalls: any[] = [];
-		const candidate = geminiResponse.candidates?.[0];
-		
-		if (candidate?.content?.parts) {
-			for (const part of candidate.content.parts) {
-				if (part.text) {
-					outputText += part.text;
-				}
-				// Handle function calls
-				if (part.functionCall) {
-					const callId = `call_${part.functionCall.name}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-					functionCalls.push({
-						type: 'function_call',
-						id: callId,
-						call_id: callId,
-						name: part.functionCall.name,
-						arguments: JSON.stringify(part.functionCall.args || {}),
-						status: 'completed',
-					});
-				}
-			}
-		}
-
-		// Extract usage info
-		const usageMetadata = geminiResponse.usageMetadata || {};
-		const inputTokens = usageMetadata.promptTokenCount || 0;
-		const outputTokens = usageMetadata.candidatesTokenCount || 0;
-
-		// Build output array
-		const output: any[] = [];
-
-		// Add function calls first (if any)
-		for (const fc of functionCalls) {
-			output.push(fc);
-		}
-
-		// Add message with text content (if any text or if no function calls)
-		if (outputText || functionCalls.length === 0) {
-			output.push({
-				type: 'message',
-				id: messageId,
-				status: 'completed',
-				role: 'assistant',
-				content: [
-					{
-						type: 'output_text',
-						text: outputText,
-						annotations: [],
-					},
-				],
-			});
-		}
-
-		// Build OpenAI Responses API response
-		const openAIResponse = {
-			id: responseId,
-			object: 'response',
-			created_at: createdAt,
-			status: 'completed',
-			completed_at: Math.floor(Date.now() / 1000),
-			error: null,
-			incomplete_details: null,
-			instructions: req.instructions || null,
-			max_output_tokens: req.max_output_tokens || null,
-			model: model,
-			output: output,
-			parallel_tool_calls: req.parallel_tool_calls ?? true,
-			previous_response_id: req.previous_response_id || null,
-			reasoning: {
-				effort: null,
-				summary: null,
-			},
-			store: req.store ?? true,
-			temperature: req.temperature ?? 1.0,
-			text: {
-				format: {
-					type: 'text',
-				},
-			},
-			tool_choice: req.tool_choice ?? 'auto',
-			tools: req.tools || [],
-			top_p: req.top_p ?? 1.0,
-			truncation: req.truncation ?? 'disabled',
-			usage: {
-				input_tokens: inputTokens,
-				input_tokens_details: {
-					cached_tokens: 0,
-				},
-				output_tokens: outputTokens,
-				output_tokens_details: {
-					reasoning_tokens: 0,
-				},
-				total_tokens: inputTokens + outputTokens,
-			},
-			user: req.user || null,
-			metadata: req.metadata || {},
-		};
-
-		return new Response(JSON.stringify(openAIResponse), {
-			...fixCors({ headers: { 'Content-Type': 'application/json' } }),
-		});
-	}
-
-	/**
-	 * Handle streaming response for Responses API
-	 */
-	private handleResponsesStream(
-		response: Response,
-		model: string,
-		responseId: string,
-		messageId: string,
-		createdAt: number,
-		req: any
-	): Response {
-		const encoder = new TextEncoder();
-		let sequenceNumber = 0;
-
-		const that = this;
-
-		const stream = new ReadableStream({
-			async start(controller) {
-				// Helper to send SSE event
-				const sendEvent = (data: any) => {
-					controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-				};
-
-				// 1. response.created
-				sendEvent({
-					type: 'response.created',
-					response: {
-						id: responseId,
-						object: 'response',
-						created_at: createdAt,
-						status: 'in_progress',
-						completed_at: null,
-						error: null,
-						incomplete_details: null,
-						instructions: req.instructions || null,
-						max_output_tokens: req.max_output_tokens || null,
-						model: model,
-						output: [],
-						parallel_tool_calls: req.parallel_tool_calls ?? true,
-						previous_response_id: req.previous_response_id || null,
-						reasoning: { effort: null, summary: null },
-						store: req.store ?? true,
-						temperature: req.temperature ?? 1.0,
-						text: { format: { type: 'text' } },
-						tool_choice: req.tool_choice ?? 'auto',
-						tools: req.tools || [],
-						top_p: req.top_p ?? 1.0,
-						truncation: req.truncation ?? 'disabled',
-						usage: null,
-						user: req.user || null,
-						metadata: req.metadata || {},
-					},
-					sequence_number: ++sequenceNumber,
-				});
-
-				// 2. response.in_progress
-				sendEvent({
-					type: 'response.in_progress',
-					response: {
-						id: responseId,
-						object: 'response',
-						created_at: createdAt,
-						status: 'in_progress',
-						completed_at: null,
-						error: null,
-						incomplete_details: null,
-						instructions: req.instructions || null,
-						max_output_tokens: req.max_output_tokens || null,
-						model: model,
-						output: [],
-						parallel_tool_calls: req.parallel_tool_calls ?? true,
-						previous_response_id: req.previous_response_id || null,
-						reasoning: { effort: null, summary: null },
-						store: req.store ?? true,
-						temperature: req.temperature ?? 1.0,
-						text: { format: { type: 'text' } },
-						tool_choice: req.tool_choice ?? 'auto',
-						tools: req.tools || [],
-						top_p: req.top_p ?? 1.0,
-						truncation: req.truncation ?? 'disabled',
-						usage: null,
-						user: req.user || null,
-						metadata: req.metadata || {},
-					},
-					sequence_number: ++sequenceNumber,
-				});
-
-				// Process Gemini SSE stream
-				const reader = response.body!.getReader();
-				const decoder = new TextDecoder();
-				let buffer = '';
-				let fullText = '';
-				let inputTokens = 0;
-				let outputTokens = 0;
-				
-				// Track function calls
-				const functionCalls: any[] = [];
-				const seenFunctionCalls = new Set<string>();
-				let outputIndex = 0;
-				let textOutputIndex = -1;
-				let textContentStarted = false;
-
-				try {
-					while (true) {
-						const { done, value } = await reader.read();
-						if (done) break;
-
-						buffer += decoder.decode(value, { stream: true });
-						const lines = buffer.split('\n');
-						buffer = lines.pop() || '';
-
-						for (const line of lines) {
-							if (line.startsWith('data: ')) {
-								const dataStr = line.substring(6).trim();
-								if (!dataStr || dataStr === '[DONE]') continue;
-
-								try {
-									const data = JSON.parse(dataStr);
-									const candidate = data.candidates?.[0];
-
-									if (candidate?.content?.parts) {
-										for (const part of candidate.content.parts) {
-											// Handle function calls
-											if (part.functionCall) {
-												const funcName = part.functionCall.name;
-												const funcArgs = part.functionCall.args || {};
-												const callId = `call_${funcName}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-												
-												// Check if we've already seen this function call (by name + args hash)
-												const callKey = `${funcName}_${JSON.stringify(funcArgs)}`;
-												if (!seenFunctionCalls.has(callKey)) {
-													seenFunctionCalls.add(callKey);
-													
-													const funcCallItem = {
-														type: 'function_call',
-														id: callId,
-														call_id: callId,
-														name: funcName,
-														arguments: JSON.stringify(funcArgs),
-														status: 'completed',
-													};
-													functionCalls.push(funcCallItem);
-
-													// Send function call output item added
-													sendEvent({
-														type: 'response.output_item.added',
-														output_index: outputIndex,
-														item: {
-															type: 'function_call',
-															id: callId,
-															call_id: callId,
-															name: funcName,
-															arguments: '',
-															status: 'in_progress',
-														},
-														sequence_number: ++sequenceNumber,
-													});
-
-													// Send function call arguments delta
-													sendEvent({
-														type: 'response.function_call_arguments.delta',
-														item_id: callId,
-														output_index: outputIndex,
-														delta: JSON.stringify(funcArgs),
-														sequence_number: ++sequenceNumber,
-													});
-
-													// Send function call arguments done
-													sendEvent({
-														type: 'response.function_call_arguments.done',
-														item_id: callId,
-														output_index: outputIndex,
-														arguments: JSON.stringify(funcArgs),
-														sequence_number: ++sequenceNumber,
-													});
-
-													// Send function call output item done
-													sendEvent({
-														type: 'response.output_item.done',
-														output_index: outputIndex,
-														item: funcCallItem,
-														sequence_number: ++sequenceNumber,
-													});
-
-													outputIndex++;
-												}
-											}
-											
-											// Handle text content
-											if (part.text) {
-												// Start text content if not started
-												if (!textContentStarted) {
-													textContentStarted = true;
-													textOutputIndex = outputIndex;
-													outputIndex++;
-
-													// Send message output item added
-													sendEvent({
-														type: 'response.output_item.added',
-														output_index: textOutputIndex,
-														item: {
-															id: messageId,
-															status: 'in_progress',
-															type: 'message',
-															role: 'assistant',
-															content: [],
-														},
-														sequence_number: ++sequenceNumber,
-													});
-
-													// Send content part added
-													sendEvent({
-														type: 'response.content_part.added',
-														item_id: messageId,
-														output_index: textOutputIndex,
-														content_index: 0,
-														part: {
-															type: 'output_text',
-															text: '',
-															annotations: [],
-														},
-														sequence_number: ++sequenceNumber,
-													});
-												}
-
-												fullText += part.text;
-
-												// Send text delta
-												sendEvent({
-													type: 'response.output_text.delta',
-													item_id: messageId,
-													output_index: textOutputIndex,
-													content_index: 0,
-													delta: part.text,
-													sequence_number: ++sequenceNumber,
-												});
-											}
-										}
-									}
-
-									// Extract usage from final chunk
-									if (data.usageMetadata) {
-										inputTokens = data.usageMetadata.promptTokenCount || inputTokens;
-										outputTokens = data.usageMetadata.candidatesTokenCount || outputTokens;
-									}
-								} catch (parseErr) {
-									console.error('[handleResponsesStream] Failed to parse SSE data:', parseErr);
-								}
-							}
-						}
-					}
-				} catch (streamErr) {
-					console.error('[handleResponsesStream] Stream error:', streamErr);
-				}
-
-				// Build final output array
-				const finalOutput: any[] = [];
-
-				// Add function calls
-				for (const fc of functionCalls) {
-					finalOutput.push(fc);
-				}
-
-				// Finalize text content if started
-				if (textContentStarted) {
-					// Send text done
-					sendEvent({
-						type: 'response.output_text.done',
-						item_id: messageId,
-						output_index: textOutputIndex,
-						content_index: 0,
-						text: fullText,
-						sequence_number: ++sequenceNumber,
-					});
-
-					// Send content part done
-					sendEvent({
-						type: 'response.content_part.done',
-						item_id: messageId,
-						output_index: textOutputIndex,
-						content_index: 0,
-						part: {
-							type: 'output_text',
-							text: fullText,
-							annotations: [],
-						},
-						sequence_number: ++sequenceNumber,
-					});
-
-					// Send message output item done
-					sendEvent({
-						type: 'response.output_item.done',
-						output_index: textOutputIndex,
-						item: {
-							id: messageId,
-							status: 'completed',
-							type: 'message',
-							role: 'assistant',
-							content: [
-								{
-									type: 'output_text',
-									text: fullText,
-									annotations: [],
-								},
-							],
-						},
-						sequence_number: ++sequenceNumber,
-					});
-
-					finalOutput.push({
-						type: 'message',
-						id: messageId,
-						status: 'completed',
-						role: 'assistant',
-						content: [
-							{
-								type: 'output_text',
-								text: fullText,
-								annotations: [],
-							},
-						],
-					});
-				} else if (functionCalls.length === 0) {
-					// No content at all, send empty message
-					sendEvent({
-						type: 'response.output_item.added',
-						output_index: 0,
-						item: {
-							id: messageId,
-							status: 'completed',
-							type: 'message',
-							role: 'assistant',
-							content: [],
-						},
-						sequence_number: ++sequenceNumber,
-					});
-
-					sendEvent({
-						type: 'response.output_item.done',
-						output_index: 0,
-						item: {
-							id: messageId,
-							status: 'completed',
-							type: 'message',
-							role: 'assistant',
-							content: [],
-						},
-						sequence_number: ++sequenceNumber,
-					});
-
-					finalOutput.push({
-						type: 'message',
-						id: messageId,
-						status: 'completed',
-						role: 'assistant',
-						content: [],
-					});
-				}
-
-				// Send response.completed
-				const completedAt = Math.floor(Date.now() / 1000);
-				sendEvent({
-					type: 'response.completed',
-					response: {
-						id: responseId,
-						object: 'response',
-						created_at: createdAt,
-						status: 'completed',
-						completed_at: completedAt,
-						error: null,
-						incomplete_details: null,
-						instructions: req.instructions || null,
-						max_output_tokens: req.max_output_tokens || null,
-						model: model,
-						output: finalOutput,
-						parallel_tool_calls: req.parallel_tool_calls ?? true,
-						previous_response_id: req.previous_response_id || null,
-						reasoning: { effort: null, summary: null },
-						store: req.store ?? true,
-						temperature: req.temperature ?? 1.0,
-						text: { format: { type: 'text' } },
-						tool_choice: req.tool_choice ?? 'auto',
-						tools: req.tools || [],
-						top_p: req.top_p ?? 1.0,
-						truncation: req.truncation ?? 'disabled',
-						usage: {
-							input_tokens: inputTokens,
-							input_tokens_details: { cached_tokens: 0 },
-							output_tokens: outputTokens,
-							output_tokens_details: { reasoning_tokens: 0 },
-							total_tokens: inputTokens + outputTokens,
-						},
-						user: req.user || null,
-						metadata: req.metadata || {},
-					},
-					sequence_number: ++sequenceNumber,
-				});
-
-				controller.close();
-			},
-		});
-
-		return new Response(stream, {
-			headers: {
-				...fixCors({}).headers,
-				'Content-Type': 'text/event-stream',
-				'Cache-Control': 'no-cache',
-				Connection: 'keep-alive',
-			},
-		});
-	}
-
-	// ==================== End of OpenAI Responses API ====================
-
-	private async handleOpenAI(request: Request): Promise<Response> {
-		console.log('[handleOpenAI] Starting to handle OpenAI request');
-		const authKey = this.env.AUTH_KEY;
-		let apiKey: string | null;
-
-		const authHeader = request.headers.get('Authorization');
-		apiKey = authHeader?.replace('Bearer ', '') ?? null;
-		console.log('[handleOpenAI] API key provided:', !!apiKey);
-
-		// 如果启用了客户端 key 透传，直接使用客户端提供的 key
-		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
-			if (!apiKey) {
-				return new Response('No API key found in the client headers,please check your request!', { status: 400 });
-			}
-			// 直接使用客户端的 API key，不需要验证
-		} else {
-			// 传统模式：验证 AUTH_KEY 并使用负载均衡
-			if (!apiKey) {
-				return new Response('No API key found in the client headers,please check your request!', { status: 400 });
-			}
-
-			if (authKey) {
-				const token = authHeader?.replace('Bearer ', '');
-				if (token !== authKey) {
-					return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
-				}
-				apiKey = await this.getRandomApiKey();
-				if (!apiKey) {
-					return new Response('No API keys configured in the load balancer.', { status: 500 });
-				}
-			}
-		}
-
-		const url = new URL(request.url);
-		const pathname = url.pathname;
-
-		const assert = (success: Boolean) => {
-			if (!success) {
-				throw new HttpError('The specified HTTP method is not allowed for the requested resource', 400);
-			}
-		};
-		const errHandler = (err: Error) => {
-			console.error(err);
-			return new Response(err.message, fixCors({ statusText: err.message ?? 'Internal Server Error', status: 500 }));
-		};
-
-		switch (true) {
-			case pathname.endsWith('/chat/completions'):
-				assert(request.method === 'POST');
-				return this.handleCompletions(await request.json(), apiKey).catch(errHandler);
-			case pathname.endsWith('/embeddings'):
-				assert(request.method === 'POST');
-				return this.handleEmbeddings(await request.json(), apiKey).catch(errHandler);
-			case pathname.endsWith('/models'):
-				assert(request.method === 'GET');
-				return this.handleModels(apiKey).catch(errHandler);
-			default:
-				throw new HttpError('404 Not Found', 404);
 		}
 	}
 }
