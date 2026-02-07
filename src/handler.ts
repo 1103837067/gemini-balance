@@ -58,27 +58,44 @@ function patchToolCalls(toolCalls: any[] | undefined) {
 }
 
 /**
- * 补丁流式 SSE chunk：逐行解析，对 data: {...} 行做 tool_calls index 补丁
+ * 创建一个带 buffer 的 SSE 补丁 TransformStream。
+ * SSE 数据行可能跨 chunk 传输，需要累积 buffer 确保完整行才处理。
  */
-function patchStreamChunk(chunk: string, controller: TransformStreamDefaultController<string>) {
-	// SSE 格式：可能包含多行，逐行处理
-	const lines = chunk.split('\n');
-	for (let i = 0; i < lines.length; i++) {
-		let line = lines[i];
-		if (line.startsWith('data: ') && line.length > 6) {
-			const dataStr = line.substring(6).trim();
-			if (dataStr && dataStr !== '[DONE]' && dataStr.startsWith('{')) {
-				try {
-					const parsed = JSON.parse(dataStr);
-					patchResponseBody(parsed);
-					line = 'data: ' + JSON.stringify(parsed);
-				} catch {
-					// JSON 解析失败，保持原样
-				}
+function createPatchTransform(): Transformer<string, string> {
+	let buffer = '';
+	return {
+		transform(chunk: string, controller: TransformStreamDefaultController<string>) {
+			buffer += chunk;
+			// 按换行拆分，最后一段可能是不完整的行，留到下次
+			const lines = buffer.split('\n');
+			buffer = lines.pop()!; // 最后一个元素可能是空串或不完整行
+
+			for (const line of lines) {
+				controller.enqueue(patchSSELine(line) + '\n');
 			}
-		}
-		// 重建行（保留原始换行）
-		controller.enqueue(line + (i < lines.length - 1 ? '\n' : ''));
+		},
+		flush(controller: TransformStreamDefaultController<string>) {
+			// 处理 buffer 中剩余的内容
+			if (buffer) {
+				controller.enqueue(patchSSELine(buffer));
+			}
+		},
+	};
+}
+
+/**
+ * 对单行 SSE 数据做补丁
+ */
+function patchSSELine(line: string): string {
+	if (!line.startsWith('data: ')) return line;
+	const dataStr = line.substring(6).trim();
+	if (!dataStr || dataStr === '[DONE]' || !dataStr.startsWith('{')) return line;
+	try {
+		const parsed = JSON.parse(dataStr);
+		patchResponseBody(parsed);
+		return 'data: ' + JSON.stringify(parsed);
+	} catch {
+		return line;
 	}
 }
 
@@ -438,10 +455,10 @@ export class LoadBalancer extends DurableObject {
 
 		// chat/completions 响应需要补丁：Google 返回的 tool_calls 缺少 index 字段
 		if (isStreaming) {
-			// 流式响应：通过 TransformStream 给每个 SSE chunk 打补丁
+			// 流式响应：通过带 buffer 的 TransformStream 给 SSE 打补丁
 			const patchedBody = response
 				.body!.pipeThrough(new TextDecoderStream())
-				.pipeThrough(new TransformStream({ transform: patchStreamChunk }))
+				.pipeThrough(new TransformStream(createPatchTransform()))
 				.pipeThrough(new TextEncoderStream());
 
 			return new Response(patchedBody, { status: response.status, headers: responseHeaders });
