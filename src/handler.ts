@@ -31,70 +31,130 @@ const makeHeaders = (apiKey: string, more?: Record<string, string>) => ({
 
 // =================================================================================================
 // Google OpenAI 兼容端点响应补丁
-// Google 返回的 tool_calls 缺少 index 字段，Vercel AI SDK 校验会报错
+//
+// 问题1: tool_calls 缺少 index 字段（Vercel AI SDK 要求必须有）
+// 问题2: tool_calls 带有 extra_content.google.thought_signature，
+//        后续多轮对话中必须回传，否则 Google 返回 400 错误。
+//        但 Vercel AI SDK 不认识这个字段，会在序列化时丢弃。
+//
+// 解决方案:
+// - 响应端: 从 tool_calls 中提取 thought_signature 并缓存，然后移除 extra_content
+//           （SDK 不认识会报错），同时补上缺失的 index
+// - 请求端: 在发送给 Google 前，将缓存的 thought_signature 注入回 assistant 消息的 tool_calls
 // =================================================================================================
 
+type SignatureCache = Map<string, { signature: string; savedAt: number }>;
+const SIGNATURE_TTL = 6 * 60 * 60 * 1000; // 6 小时
+
 /**
- * 补丁非流式响应：给 choices[*].message.tool_calls[*] 添加缺失的 index
+ * 从响应中提取 thought_signature 并缓存，同时清理 SDK 不认识的字段、补 index
  */
-function patchResponseBody(body: any) {
+function patchResponseBody(body: any, signatureCache: SignatureCache) {
 	if (!body?.choices) return;
 	for (const choice of body.choices) {
-		patchToolCalls(choice?.message?.tool_calls);
-		patchToolCalls(choice?.delta?.tool_calls);
+		patchToolCallsInPlace(choice?.message?.tool_calls, signatureCache);
+		patchToolCallsInPlace(choice?.delta?.tool_calls, signatureCache);
 	}
 }
 
-/**
- * 给 tool_calls 数组中缺失 index 的元素补上 index
- */
-function patchToolCalls(toolCalls: any[] | undefined) {
+function patchToolCallsInPlace(toolCalls: any[] | undefined, signatureCache: SignatureCache) {
 	if (!Array.isArray(toolCalls)) return;
 	for (let i = 0; i < toolCalls.length; i++) {
-		if (toolCalls[i] && toolCalls[i].index === undefined) {
-			toolCalls[i].index = i;
+		const tc = toolCalls[i];
+		if (!tc) continue;
+
+		// 补 index
+		if (tc.index === undefined) {
+			tc.index = i;
+		}
+
+		// 提取并缓存 thought_signature
+		const sig = tc.extra_content?.google?.thought_signature;
+		if (sig && tc.id) {
+			signatureCache.set(tc.id, { signature: sig, savedAt: Date.now() });
+			console.log(`[patchToolCalls] Cached thought_signature for tool_call ${tc.id}`);
+		}
+
+		// 移除 extra_content（SDK 不认识，留着会导致问题）
+		if (tc.extra_content) {
+			delete tc.extra_content;
 		}
 	}
 }
 
 /**
- * 创建一个带 buffer 的 SSE 补丁 TransformStream。
- * SSE 数据行可能跨 chunk 传输，需要累积 buffer 确保完整行才处理。
+ * 在发送给 Google 前，将缓存的 thought_signature 注入回请求体
  */
-function createPatchTransform(): Transformer<string, string> {
+function injectSignaturesIntoRequest(body: any, signatureCache: SignatureCache) {
+	if (!body?.messages || !Array.isArray(body.messages)) return;
+	let injected = 0;
+
+	for (const msg of body.messages) {
+		if (msg.role !== 'assistant' || !Array.isArray(msg.tool_calls)) continue;
+
+		for (const tc of msg.tool_calls) {
+			if (!tc.id) continue;
+			const cached = signatureCache.get(tc.id);
+			if (cached && Date.now() - cached.savedAt < SIGNATURE_TTL) {
+				// 注入 extra_content.google.thought_signature
+				tc.extra_content = tc.extra_content || {};
+				tc.extra_content.google = tc.extra_content.google || {};
+				tc.extra_content.google.thought_signature = cached.signature;
+				injected++;
+			}
+		}
+	}
+
+	if (injected > 0) {
+		console.log(`[injectSignatures] Injected ${injected} thought_signature(s) into request`);
+	}
+}
+
+/**
+ * 清理过期的缓存条目
+ */
+function cleanupSignatureCache(cache: SignatureCache) {
+	const now = Date.now();
+	for (const [key, val] of cache) {
+		if (now - val.savedAt > SIGNATURE_TTL) {
+			cache.delete(key);
+		}
+	}
+}
+
+/**
+ * 创建带 buffer 的 SSE 补丁 TransformStream
+ */
+function createPatchTransform(signatureCache: SignatureCache): Transformer<string, string> {
 	let buffer = '';
 	return {
 		transform(chunk: string, controller: TransformStreamDefaultController<string>) {
 			buffer += chunk;
-			// 按换行拆分，最后一段可能是不完整的行，留到下次
 			const lines = buffer.split('\n');
-			buffer = lines.pop()!; // 最后一个元素可能是空串或不完整行
+			buffer = lines.pop()!;
 
 			for (const line of lines) {
-				controller.enqueue(patchSSELine(line) + '\n');
+				controller.enqueue(patchSSELine(line, signatureCache) + '\n');
 			}
 		},
 		flush(controller: TransformStreamDefaultController<string>) {
-			// 处理 buffer 中剩余的内容
 			if (buffer) {
-				controller.enqueue(patchSSELine(buffer));
+				controller.enqueue(patchSSELine(buffer, signatureCache));
 			}
 		},
 	};
 }
 
-/**
- * 对单行 SSE 数据做补丁
- */
-function patchSSELine(line: string): string {
+function patchSSELine(line: string, signatureCache: SignatureCache): string {
 	if (!line.startsWith('data: ')) return line;
 	const dataStr = line.substring(6).trim();
 	if (!dataStr || dataStr === '[DONE]' || !dataStr.startsWith('{')) return line;
 	try {
 		const parsed = JSON.parse(dataStr);
-		patchResponseBody(parsed);
+		patchResponseBody(parsed, signatureCache);
 		return 'data: ' + JSON.stringify(parsed);
-	} catch {
+	} catch (e) {
+		console.error('[patchSSELine] JSON parse failed:', line.substring(0, 200), e);
 		return line;
 	}
 }
@@ -102,6 +162,7 @@ function patchSSELine(line: string): string {
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class LoadBalancer extends DurableObject {
 	env: Env;
+	signatureCache: SignatureCache;
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -112,6 +173,7 @@ export class LoadBalancer extends DurableObject {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.env = env;
+		this.signatureCache = new Map();
 		// Initialize the database schema upon first creation.
 		this.ctx.storage.sql.exec(`
 			CREATE TABLE IF NOT EXISTS api_keys (
@@ -218,6 +280,7 @@ export class LoadBalancer extends DurableObject {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		console.log(`[fetch] ${request.method} ${request.url}`);
 		if (request.method === 'OPTIONS') {
 			return new Response(null, {
 				status: 204,
@@ -383,11 +446,13 @@ export class LoadBalancer extends DurableObject {
 	 * 支持: chat/completions, embeddings, models
 	 */
 	private async handleOpenAIProxy(request: Request): Promise<Response> {
+		console.log('[handleOpenAIProxy] Starting');
 		const apiKey = await this.resolveApiKey(request);
 		if (apiKey instanceof Response) return apiKey;
 
 		const url = new URL(request.url);
 		const pathname = url.pathname;
+		console.log(`[handleOpenAIProxy] pathname: ${pathname}, method: ${request.method}`);
 
 		// 映射路径到 Google OpenAI 兼容端点
 		let targetPath: string;
@@ -404,8 +469,11 @@ export class LoadBalancer extends DurableObject {
 		}
 
 		const targetUrl = `${OPENAI_COMPAT_BASE}${targetPath}`;
+		console.log(`[handleOpenAIProxy] targetUrl: ${targetUrl}`);
 
-		// 对于 chat/completions，需要读取请求体判断是否 streaming
+		// 对于 chat/completions，需要读取请求体：
+		// 1. 判断是否 streaming
+		// 2. 注入缓存的 thought_signature（多轮 tool calling 必须）
 		let requestBody: string | null = null;
 		let isStreaming = false;
 		if (isChatCompletions && request.method === 'POST') {
@@ -413,8 +481,14 @@ export class LoadBalancer extends DurableObject {
 			try {
 				const parsed = JSON.parse(requestBody);
 				isStreaming = parsed.stream === true;
-			} catch {
-				// 解析失败就当不是 streaming
+				console.log(`[handleOpenAIProxy] model: ${parsed.model}, stream: ${isStreaming}, has_tools: ${!!parsed.tools}, messages_count: ${parsed.messages?.length}`);
+
+				// 将缓存的 thought_signature 注入回 assistant 的 tool_calls
+				cleanupSignatureCache(this.signatureCache);
+				injectSignaturesIntoRequest(parsed, this.signatureCache);
+				requestBody = JSON.stringify(parsed);
+			} catch (e) {
+				console.error('[handleOpenAIProxy] Failed to parse request body:', e);
 			}
 		}
 
@@ -424,20 +498,36 @@ export class LoadBalancer extends DurableObject {
 			headers.set('Content-Type', request.headers.get('content-type')!);
 		}
 
+		console.log(`[handleOpenAIProxy] Sending to Google, streaming: ${isStreaming}`);
 		const response = await fetch(targetUrl, {
 			method: request.method,
 			headers,
 			body: requestBody ?? (request.method === 'GET' || request.method === 'HEAD' ? null : request.body),
 		});
+		console.log(`[handleOpenAIProxy] Google response: ${response.status} ${response.statusText}`);
 
 		// 处理 429 错误：标记 key 异常
 		if (response.status === 429) {
-			console.error(`API key received 429 from Google OpenAI compat endpoint.`);
+			console.error(`[handleOpenAIProxy] API key received 429`);
 			await this.ctx.storage.sql.exec(
 				"UPDATE api_key_statuses SET key_group = 'abnormal', failed_count = failed_count + 1, last_checked_at = ? WHERE api_key = ?",
 				Date.now(),
 				apiKey
 			);
+		}
+
+		// 非 OK 响应：读取错误体并记录日志
+		if (!response.ok) {
+			const errorBody = await response.text();
+			console.error(`[handleOpenAIProxy] Error response from Google: ${response.status}`, errorBody);
+			const responseHeaders = new Headers(response.headers);
+			responseHeaders.set('Access-Control-Allow-Origin', '*');
+			responseHeaders.delete('transfer-encoding');
+			responseHeaders.delete('connection');
+			responseHeaders.delete('keep-alive');
+			responseHeaders.delete('content-encoding');
+			responseHeaders.set('Referrer-Policy', 'no-referrer');
+			return new Response(errorBody, { status: response.status, headers: responseHeaders });
 		}
 
 		const responseHeaders = new Headers(response.headers);
@@ -448,24 +538,27 @@ export class LoadBalancer extends DurableObject {
 		responseHeaders.delete('content-encoding');
 		responseHeaders.set('Referrer-Policy', 'no-referrer');
 
-		// 非 OK 响应或非 chat/completions 直接透传
-		if (!response.ok || !isChatCompletions) {
+		// 非 chat/completions 直接透传
+		if (!isChatCompletions) {
 			return new Response(response.body, { status: response.status, headers: responseHeaders });
 		}
 
-		// chat/completions 响应需要补丁：Google 返回的 tool_calls 缺少 index 字段
+		// chat/completions 响应补丁：
+		// 1. 补 tool_calls 缺失的 index
+		// 2. 提取 thought_signature 并缓存（供后续多轮对话回传）
+		// 3. 移除 extra_content（SDK 不认识）
 		if (isStreaming) {
-			// 流式响应：通过带 buffer 的 TransformStream 给 SSE 打补丁
+			console.log('[handleOpenAIProxy] Applying streaming patch transform');
 			const patchedBody = response
 				.body!.pipeThrough(new TextDecoderStream())
-				.pipeThrough(new TransformStream(createPatchTransform()))
+				.pipeThrough(new TransformStream(createPatchTransform(this.signatureCache)))
 				.pipeThrough(new TextEncoderStream());
 
 			return new Response(patchedBody, { status: response.status, headers: responseHeaders });
 		} else {
-			// 非流式响应：读取 JSON，打补丁后返回
 			const body = await response.json();
-			patchResponseBody(body);
+			console.log('[handleOpenAIProxy] Non-stream response, patching');
+			patchResponseBody(body, this.signatureCache);
 			return new Response(JSON.stringify(body), { status: response.status, headers: responseHeaders });
 		}
 	}
